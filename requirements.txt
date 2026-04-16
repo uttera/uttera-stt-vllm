@@ -1,0 +1,10 @@
+vllm>=0.19.0,<0.20.0
+torch>=2.9.0,<2.11.0
+torchaudio>=2.9.0,<2.11.0
+fastapi
+uvicorn
+pydantic>=2.0
+python-multipart
+python-dotenv
+redis[asyncio]>=5.0.0
+huggingface-hub
