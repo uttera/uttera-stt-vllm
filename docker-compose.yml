@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  uttera-stt-vllm:
+    build: .
+    image: uttera-stt-vllm:0.1.0
+    container_name: uttera-stt-vllm
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      # Override or supplement .env here.
+      HF_HOME: /app/assets/models/huggingface
+    volumes:
+      - ./assets:/app/assets
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:5000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s

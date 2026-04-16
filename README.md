@@ -7,9 +7,9 @@
 High-throughput Speech-to-Text server built on **vLLM continuous batching**.
 Whisper-large-v3-turbo today, room for future Transformer STT backends.
 
-> **Status**: pre-alpha skeleton. Active development. See
-> [ROADMAP.md](ROADMAP.md) for what's planned. First release expected
-> Q2 2026.
+> **Status**: v0.1.0 — pre-alpha, active development. See
+> [ROADMAP.md](ROADMAP.md) for what's planned and [CHANGELOG.md](CHANGELOG.md)
+> for what has landed. API surface expected to stabilise at v1.0.0.
 
 ## Positioning
 
@@ -20,7 +20,7 @@ Whisper-large-v3-turbo today, room for future Transformer STT backends.
 
 **Choose `uttera-stt-vllm` when**:
 - You transcribe hours of audio per day across many concurrent streams.
-- Continuous batching maximizes GPU utilization.
+- You want continuous batching to maximise GPU utilisation.
 - You have large-VRAM GPUs dedicated to inference.
 
 **Choose `uttera-stt-hotcold` when**:
@@ -31,16 +31,24 @@ Whisper-large-v3-turbo today, room for future Transformer STT backends.
 ## Architecture
 
 Built on [vLLM](https://github.com/vllm-project/vllm) (native Whisper
-support since v0.6.6). Handles audio chunking, continuous batching, and
-OpenAI-compatible API out of the box.
+support since v0.6.6). A **single Python process** hosts:
 
-- **Auto-chunking**: audio files longer than Whisper's 30 s context are
-  split, transcribed in parallel batches, and stitched back together
-  transparently. A one-hour podcast becomes ~120 chunks, all fused into
-  one batch.
-- **OpenAI-compatible**: drop-in for `openai.audio.transcriptions.create()`.
-- **Long-audio support**: configurable `VLLM_MAX_AUDIO_CLIP_FILESIZE_MB`
-  env var lets you transcribe audios of several hours in a single request.
+- `vllm.v1.engine.async_llm.AsyncLLM` — the model + continuous batcher.
+- `OpenAIServingTranscription` / `OpenAIServingTranslation` — vLLM's stock
+  handlers for audio preprocessing (resample to 16 kHz, chunk at 30 s),
+  sampling, and OpenAI-shaped responses.
+- A thin FastAPI layer (`main_stt.py`) that exposes the four endpoints
+  Uttera expects — `/v1/audio/transcriptions`, `/v1/audio/translations`,
+  `/v1/models`, `/health` — and carries the Redis self-registration
+  protocol from the sibling repos.
+
+**What is *not* here**:
+- No hot/cold worker pool, no shared work queue, no subprocess spawning.
+- No hand-rolled audio preprocessing. vLLM does it and we do not second-guess.
+
+See [API.md](API.md) for endpoint details, [HISTORY.md](HISTORY.md) for
+why we have two STT repos, and [ROADMAP.md](ROADMAP.md) for what is in
+flight.
 
 ## Benchmarks (preview)
 
@@ -56,23 +64,58 @@ Empirical results on 1× RTX 5090, Whisper-large-v3-turbo via vLLM 0.19,
 | Failures | 0 |
 
 A **58-minute YouTube video** transcribed in **11.6 seconds** end-to-end.
-See [benchmarks/](benchmarks/) for the methodology.
 
-## Quickstart (coming soon)
+Bench harness in `tests/` pending port — see ROADMAP. The informal
+numbers above were captured on an earlier test harness that will be
+re-run and published in `tests/bench_400x.py`.
+
+## Quickstart
 
 ```bash
 git clone https://github.com/uttera/uttera-stt-vllm.git
 cd uttera-stt-vllm
-./setup.sh
-VLLM_MAX_AUDIO_CLIP_FILESIZE_MB=500 ./scripts/run.sh
+cp .env.example .env      # tweak WHISPER_MODEL, VLLM_* if needed
+./setup.sh                # creates venv, installs vLLM, pre-downloads the model
+source venv/bin/activate
+uvicorn main_stt:app --host 0.0.0.0 --port 5000
 ```
+
+Then:
+
+```bash
+curl -X POST http://localhost:5000/v1/audio/transcriptions \
+  -F "file=@sample.wav" \
+  -F "language=es"
+```
+
+## Configuration
+
+All tuning is env var driven. See [.env.example](.env.example) for the
+full surface. The most common overrides:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `WHISPER_MODEL` | `openai/whisper-large-v3-turbo` | Any HF model compatible with vLLM transcription. |
+| `SERVED_MODEL_NAME` | `whisper-1` | Name advertised via `/v1/models`. |
+| `VLLM_DTYPE` | `float16` | `float16` / `bfloat16` / `float32`. |
+| `VLLM_GPU_MEM_UTIL` | `0.9` | Fraction of VRAM vLLM is allowed to claim. |
+| `VLLM_MAX_NUM_SEQS` | `64` | Maximum in-flight sequences (batch size). |
+| `VLLM_MAX_MODEL_LEN` | `448` | Whisper context cap (tokens). |
+| `PORT` | `5000` | HTTP port. |
+| `REDIS_URL` | _(empty)_ | Optional; enables self-registration for a router. |
+
+## Deployment
+
+- **Docker**: `docker compose up -d` (GPU passthrough configured in
+  `docker-compose.yml`).
+- **systemd**: `uttera-stt-vllm.yml` is a ready-to-adapt unit file;
+  install at `/etc/systemd/system/uttera-stt-vllm.service`.
 
 ## Hardware requirements
 
-- GPU: NVIDIA with 24 GB+ VRAM recommended for Whisper-large-v3-turbo
-  at high concurrency. Lower-VRAM GPUs can run smaller Whisper variants.
-- Blackwell (RTX 5090) supported with CUDA 12.8. See
-  [docs/blackwell.md](docs/blackwell.md) for the build procedure.
+- GPU: NVIDIA with 24 GB+ VRAM recommended for Whisper-large-v3-turbo at
+  high concurrency. Smaller Whisper variants run on lower-VRAM GPUs.
+- Blackwell (RTX 5090) supported with CUDA 12.8.
 
 ## License
 

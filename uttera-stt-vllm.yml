@@ -1,0 +1,29 @@
+# systemd unit: Uttera STT vLLM Server
+#
+# Install:
+#   sudo cp uttera-stt-vllm.yml /etc/systemd/system/uttera-stt-vllm.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now uttera-stt-vllm
+#
+# Tweak the User, WorkingDirectory, and EnvironmentFile to match your deploy.
+
+[Unit]
+Description=Uttera STT vLLM Server (Whisper, continuous batching)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=uttera
+Group=uttera
+WorkingDirectory=/opt/uttera-stt-vllm
+EnvironmentFile=-/opt/uttera-stt-vllm/.env
+ExecStart=/opt/uttera-stt-vllm/venv/bin/uvicorn main_stt:app --host 0.0.0.0 --port 5000
+Restart=on-failure
+RestartSec=5
+# vLLM can take a while to compile CUDA graphs on first boot; give it room.
+TimeoutStartSec=300
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
