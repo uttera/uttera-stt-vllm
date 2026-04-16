@@ -79,11 +79,11 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 
 # vLLM imports (after .env load so VLLM_* env vars are honoured).
 from vllm.engine.arg_utils import AsyncEngineArgs  # noqa: E402
-from vllm.entrypoints.openai.protocol import (  # noqa: E402
+from vllm.entrypoints.openai.speech_to_text.protocol import (  # noqa: E402
     TranscriptionRequest,
     TranslationRequest,
 )
-from vllm.entrypoints.openai.serving_models import (  # noqa: E402
+from vllm.entrypoints.openai.models.serving import (  # noqa: E402
     BaseModelPath,
     OpenAIServingModels,
 )
@@ -207,6 +207,8 @@ async def _lifespan(app: FastAPI):
     log.info(f"Starting Uttera STT vLLM v{SERVER_VERSION} — model={WHISPER_MODEL}")
 
     try:
+        # vLLM 0.19 infers the runner from the model architecture (Whisper
+        # triggers the transcription path automatically); no `task` kwarg.
         engine_args = AsyncEngineArgs(
             model=WHISPER_MODEL,
             served_model_name=SERVED_MODEL_NAME,
@@ -215,7 +217,6 @@ async def _lifespan(app: FastAPI):
             max_num_seqs=VLLM_MAX_NUM_SEQS,
             max_model_len=VLLM_MAX_MODEL_LEN,
             enforce_eager=VLLM_ENFORCE_EAGER,
-            task="transcription",
             download_dir=MODEL_CACHE_DIR,
         )
         vllm_config = engine_args.create_engine_config(
@@ -234,11 +235,11 @@ async def _lifespan(app: FastAPI):
         ]
         serving_models = OpenAIServingModels(
             engine_client=_engine,
-            model_config=vllm_config.model_config,
             base_model_paths=base_paths,
             lora_modules=[],
         )
-        await serving_models.init_static_loras()
+        if hasattr(serving_models, "init_static_loras"):
+            await serving_models.init_static_loras()
 
         _transcription_handler = OpenAIServingTranscription(
             _engine,
