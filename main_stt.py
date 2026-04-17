@@ -11,7 +11,7 @@
 # See LICENSE and NOTICE for full terms and attributions.
 #
 # Package: uttera-stt-vllm
-# Version: 1.0.0
+# Version: 1.1.0
 # Maintainer: J.A.R.V.I.S. A.I., Hugo L. Espuny
 # Description: High-throughput Whisper STT server on vLLM continuous batching.
 #              A single Python process hosts vLLM's AsyncLLM engine; concurrency
@@ -19,6 +19,18 @@
 #              no per-request worker spawning, no shared work queue.
 #
 # CHANGELOG:
+# - 1.1.0 (2026-04-17): /v1/audio/translations now works with Whisper-turbo
+#   (which lacks the native translate task) via a Whisper-transcribe →
+#   LibreTranslate post-processing pipeline. Controlled by the new env var
+#   LIBRETRANSLATE_URL (+ optional LIBRETRANSLATE_API_KEY,
+#   LIBRETRANSLATE_TIMEOUT_S). When the URL is unset, the endpoint returns
+#   HTTP 501 with a message telling the caller to either configure it or
+#   switch to a model with native translate support (e.g. whisper-large-v3).
+#   The pipeline also unlocks target languages other than English — Whisper
+#   native translate only goes to English; LibreTranslate supports 49
+#   cross-language pairs (es → fr, ru → ca, etc.). If source == target
+#   (detected language matches `to_language`), LibreTranslate is skipped and
+#   the raw transcription is returned.
 # - 1.0.0 (2026-04-17): First stable release. Functionally complete and
 #   benchmarked against uttera-stt-hotcold on LibriSpeech and an internal
 #   Spanish corpus (see github.com/uttera/uttera-benchmarks). Added
@@ -37,7 +49,7 @@
 #   with uttera-stt-hotcold house style. Redis self-registration carried
 #   over from the sibling repo. Pre-release — active development.
 #
-# --- Architecture Summary (v1.0.0) ---
+# --- Architecture Summary (v1.1.0) ---
 #
 # * SINGLE-PROCESS ENGINE
 #   vllm.v1.engine.async_llm.AsyncLLM is instantiated once at startup
@@ -109,7 +121,7 @@ from vllm.v1.engine.async_llm import AsyncLLM  # noqa: E402
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 
 DEBUG = os.environ.get("DEBUG", "false").lower() in ("1", "true", "yes")
 logging.basicConfig(
@@ -141,6 +153,17 @@ VLLM_ENFORCE_EAGER = os.environ.get("VLLM_ENFORCE_EAGER", "false").lower() in ("
 # Drain time (seconds) considered 100% load for routing score. Matches the
 # hotcold sibling so the upstream router can use a single threshold.
 ROUTING_DRAIN_CAP_SECONDS = float(os.environ.get("ROUTING_DRAIN_CAP_SECONDS", "120"))
+
+# LibreTranslate post-processing for /v1/audio/translations.
+# When this URL is set, /v1/audio/translations first transcribes via the
+# Whisper model (so turbo — which lacks the "translate" task — still works),
+# then passes the text through LibreTranslate to reach the requested
+# `to_language`. If LIBRETRANSLATE_URL is empty, /v1/audio/translations
+# returns HTTP 501 with a message telling the caller to either configure it
+# or switch to a model with native translate support (e.g. whisper-large-v3).
+LIBRETRANSLATE_URL = os.environ.get("LIBRETRANSLATE_URL", "").rstrip("/")
+LIBRETRANSLATE_API_KEY = os.environ.get("LIBRETRANSLATE_API_KEY", "")
+LIBRETRANSLATE_TIMEOUT_S = float(os.environ.get("LIBRETRANSLATE_TIMEOUT_S", "30"))
 
 # Redis self-registration (opt-in). If REDIS_URL is unset, publishing is skipped.
 REDIS_URL = os.environ.get("REDIS_URL", "")
@@ -351,6 +374,40 @@ def _routing_state() -> dict:
     return {"load_score": load, "accepts_requests": accepts}
 
 
+# Whisper emits ISO-639-1 codes (e.g. "zh") but LibreTranslate expects
+# different codes for a few Asian languages. Translate them at the boundary.
+_WHISPER_TO_LIBRETRANSLATE_LANG = {
+    "zh": "zh-Hans",
+    "zh-cn": "zh-Hans",
+    "zh-tw": "zh-Hant",
+}
+
+
+def _normalise_lang_for_libretranslate(code: str) -> str:
+    if not code:
+        return code
+    code = code.lower()
+    return _WHISPER_TO_LIBRETRANSLATE_LANG.get(code, code)
+
+
+async def _libretranslate(text: str, source: str, target: str) -> str:
+    """Call LibreTranslate. Raises on network or HTTP errors; caller maps to 502/501."""
+    import httpx  # already a transitive dep; import lazily so tests without it still start
+    src = _normalise_lang_for_libretranslate(source)
+    tgt = _normalise_lang_for_libretranslate(target)
+    payload: dict = {"q": text, "source": src, "target": tgt, "format": "text"}
+    if LIBRETRANSLATE_API_KEY:
+        payload["api_key"] = LIBRETRANSLATE_API_KEY
+    async with httpx.AsyncClient(timeout=LIBRETRANSLATE_TIMEOUT_S) as client:
+        r = await client.post(f"{LIBRETRANSLATE_URL}/translate", json=payload)
+        r.raise_for_status()
+        data = r.json()
+    out = data.get("translatedText")
+    if not isinstance(out, str):
+        raise RuntimeError(f"Unexpected LibreTranslate response: {data}")
+    return out
+
+
 # -------------------------------
 # 5. Endpoints
 # -------------------------------
@@ -393,15 +450,47 @@ async def create_translations(
     raw_request: Request,
     request: Annotated[TranslationRequest, Form()],
 ):
+    """
+    Pipeline: Whisper transcribes in the source language, LibreTranslate
+    translates the text to `to_language` (default "en"). This works for any
+    Whisper model — including turbo, which lacks the native `translate`
+    task — and supports target languages beyond English, which plain
+    Whisper translate does not.
+
+    Requires LIBRETRANSLATE_URL; without it the endpoint returns HTTP 501.
+    """
     global _in_flight, _total_errors
-    if _translation_handler is None:
+    if _transcription_handler is None:
         raise HTTPException(status_code=503, detail="Engine not ready")
+    if not LIBRETRANSLATE_URL:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Translation is disabled: LIBRETRANSLATE_URL is not set. "
+                "Either configure a LibreTranslate endpoint or run this "
+                "server with a Whisper model that supports the native "
+                "`translate` task (e.g. openai/whisper-large-v3)."
+            ),
+        )
+
+    target_lang = (request.to_language or "en").lower()
+
+    # Build a TranscriptionRequest that mirrors the TranslationRequest but
+    # forces verbose_json so we receive the detected source language.
+    transcription_req = TranscriptionRequest(
+        file=request.file,
+        model=request.model,
+        prompt=request.prompt,
+        response_format="verbose_json",
+        temperature=request.temperature,
+        language=request.language,  # None means Whisper auto-detect
+    )
 
     audio_data = await request.file.read()
     _in_flight += 1
     try:
-        result = await _translation_handler.create_translation(
-            audio_data, request, raw_request,
+        transcribed = await _transcription_handler.create_transcription(
+            audio_data, transcription_req, raw_request,
         )
     except Exception:
         _total_errors += 1
@@ -410,14 +499,43 @@ async def create_translations(
         _in_flight -= 1
         _update_rps()
 
-    if hasattr(result, "__aiter__"):
-        return StreamingResponse(result, media_type="text/event-stream")
-    if hasattr(result, "code"):
+    # Propagate transcription errors as-is.
+    if hasattr(transcribed, "code"):
         return JSONResponse(
-            status_code=getattr(result, "code", 500),
-            content=result.model_dump(),
+            status_code=getattr(transcribed, "code", 500),
+            content=transcribed.model_dump(),
         )
-    return JSONResponse(content=result.model_dump())
+    if hasattr(transcribed, "__aiter__"):
+        # We requested a non-streaming verbose response; if the handler
+        # returned a generator something went wrong upstream.
+        raise HTTPException(
+            status_code=500,
+            detail="Transcription handler returned a stream unexpectedly.",
+        )
+
+    text = getattr(transcribed, "text", "") or ""
+    source_lang = (getattr(transcribed, "language", "") or "").lower()
+    log.info(f"[translate] transcribed type={type(transcribed).__name__} "
+             f"source={source_lang!r} target={target_lang!r} text_preview={text[:80]!r}")
+
+    # No translation needed.
+    if not text.strip():
+        return JSONResponse(content={"text": text})
+    if source_lang and source_lang == target_lang:
+        log.info("[translate] source==target, skipping LibreTranslate")
+        return JSONResponse(content={"text": text})
+
+    # Translate via LibreTranslate.
+    try:
+        translated = await _libretranslate(text, source_lang or "auto", target_lang)
+    except Exception as e:
+        log.warning(f"LibreTranslate call failed: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Translation backend failure: {type(e).__name__}: {e}",
+        )
+
+    return JSONResponse(content={"text": translated})
 
 
 @app.get("/v1/models")

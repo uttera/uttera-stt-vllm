@@ -9,10 +9,10 @@
 High-throughput Speech-to-Text server built on **vLLM continuous batching**.
 Whisper-large-v3-turbo today, room for future Transformer STT backends.
 
-> **Status**: v1.0.0 — first stable release. API surface is considered
-> stable; breaking changes will bump the major. See
-> [ROADMAP.md](ROADMAP.md) for upcoming features and
-> [CHANGELOG.md](CHANGELOG.md) for the full history.
+> **Status**: v1.1.0 — stable. `/v1/audio/translations` now works with
+> Whisper-turbo via a LibreTranslate post-processing pipeline and
+> supports arbitrary target languages (not just English). See
+> [CHANGELOG.md](CHANGELOG.md) and [ROADMAP.md](ROADMAP.md).
 
 ## Positioning
 
@@ -119,6 +119,9 @@ full surface. The most common overrides:
 | `VLLM_MAX_NUM_SEQS` | `64` | Maximum in-flight sequences (batch size). |
 | `VLLM_MAX_MODEL_LEN` | `448` | Whisper context cap (tokens). |
 | `PORT` | `5000` | HTTP port. |
+| `LIBRETRANSLATE_URL` | _(empty)_ | Base URL of a [LibreTranslate](https://libretranslate.com) instance. Required for `/v1/audio/translations` to work on a Whisper model without native translate (incl. turbo). |
+| `LIBRETRANSLATE_API_KEY` | _(empty)_ | Optional, only if your LibreTranslate instance enforces a key. |
+| `LIBRETRANSLATE_TIMEOUT_S` | `30` | Timeout for the translation call. |
 | `REDIS_URL` | _(empty)_ | Optional; enables self-registration for a router. |
 
 ## Deployment

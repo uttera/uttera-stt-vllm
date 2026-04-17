@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-04-17
+
+Translation works again — and now works better than Whisper's own translate.
+
+### Added
+- **`/v1/audio/translations` pipeline via LibreTranslate**. The endpoint
+  now transcribes the audio with Whisper (which works on turbo and every
+  other multilingual Whisper variant) and then posts the text to a
+  LibreTranslate instance for the final translation. This has three
+  advantages over relying on Whisper's native `translate` task:
+  1. Works with `openai/whisper-large-v3-turbo` (the v1.0.0 default),
+     which was trained without the `translate` task.
+  2. Supports arbitrary target languages via the `to_language` request
+     parameter, not only English. LibreTranslate ships ~49 language
+     pairs; Whisper's own translate only goes → English.
+  3. Decouples transcription quality from translation quality; both can
+     be tuned independently.
+- New env vars:
+  - `LIBRETRANSLATE_URL` — base URL of a running LibreTranslate instance
+    (e.g. `http://localhost:5200`). **Required** for the translation
+    endpoint; if unset, `/v1/audio/translations` returns HTTP 501 with a
+    clear message.
+  - `LIBRETRANSLATE_API_KEY` — optional key if your instance requires
+    one.
+  - `LIBRETRANSLATE_TIMEOUT_S` — timeout for the translation call
+    (default 30 s).
+- `to_language` request form field honoured on `/v1/audio/translations`.
+  Defaults to `"en"` to preserve OpenAI-compatible behaviour when the
+  caller does not specify one.
+
+### Changed
+- **`SERVER_VERSION` bumped to `1.1.0`.**
+- `/v1/audio/translations` behaviour: when the detected source language
+  equals `to_language`, LibreTranslate is skipped and the raw Whisper
+  transcription is returned unchanged — saves a round-trip for the
+  no-op case.
+- On LibreTranslate failure (network, HTTP, malformed response), the
+  endpoint returns HTTP 502 with the exception type and message. We do
+  not fall back silently to the untranslated transcription, because
+  that would leak source-language text under a response schema that
+  promises the target language.
+
+### Known limitations
+- Language-code mapping between Whisper output and LibreTranslate is
+  direct for most codes (ISO-639-1). For Chinese, Whisper emits `zh`
+  while LibreTranslate expects `zh-Hans` / `zh-Hant`; a small mapping
+  in `main_stt.py` handles this case. Other mismatches may exist for
+  uncommon languages — file an issue if you hit one.
+
 ## [1.0.0] - 2026-04-17
 
 First stable release. Functionally complete, lint- and structure-verified
