@@ -52,14 +52,44 @@ curl -X POST http://localhost:5000/v1/audio/transcriptions \
 
 ## `POST /v1/audio/translations`
 
-Translate audio (any source language) **into English**. Mirrors OpenAI's `/v1/audio/translations`.
+Translate audio to a **target language** (default English, matching OpenAI). Mirrors OpenAI's `/v1/audio/translations` and extends it with an explicit `to_language` field.
 
-Same request schema as transcription, minus `language` (always English output). `response_format` accepts the same values.
+Implementation: Whisper transcribes in the source language (auto-detected or forced via `language`), then the text is posted to a LibreTranslate instance for the final translation. This:
+
+- works with any multilingual Whisper model — including `whisper-large-v3-turbo`, which was trained without the native `translate` task;
+- supports target languages other than English, which Whisper native translate does not.
+
+### Extra request fields vs. transcriptions
+
+| Field | Type | Notes |
+|---|---|---|
+| `to_language` | string | ISO-639-1 target (`en`, `es`, `fr`, `de`, …). Defaults to `"en"` for OpenAI-compatibility. |
+| `language` | string | Optional **source** language hint for Whisper. Omit to auto-detect. |
+
+### Examples
 
 ```bash
+# OpenAI-default behaviour: Spanish → English
 curl -X POST http://localhost:5000/v1/audio/translations \
   -F "file=@spanish-clip.wav"
+
+# Spanish → French
+curl -X POST http://localhost:5000/v1/audio/translations \
+  -F "file=@spanish-clip.wav" \
+  -F "to_language=fr"
+
+# Same source and target — LibreTranslate is skipped, transcription returned
+curl -X POST http://localhost:5000/v1/audio/translations \
+  -F "file=@spanish-clip.wav" \
+  -F "to_language=es"
 ```
+
+### Errors
+
+| HTTP | When |
+|---|---|
+| 501 | `LIBRETRANSLATE_URL` is not configured. The response `detail` tells the caller to either set it or run a Whisper model with native translate support. |
+| 502 | LibreTranslate call failed (network, HTTP error, or malformed response). We do **not** fall back silently to the untranslated transcription, because that would leak source-language text under a response schema that promises the target language. |
 
 ## `GET /v1/models`
 
