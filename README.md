@@ -133,11 +133,27 @@ full surface. The most common overrides:
   high concurrency. Smaller Whisper variants run on lower-VRAM GPUs.
 - Blackwell (RTX 5090) supported with CUDA 12.8.
 
-## License
+## 🛡 License
 
-[Apache License 2.0](LICENSE). Whisper model weights are released by OpenAI
-under the MIT License — commercial use permitted without restriction.
-See [NOTICE](NOTICE) for full attributions.
+**Server source code**: [Apache License 2.0](LICENSE). Commercial use permitted.
+
+**Whisper model weights** (OpenAI): released under the MIT License —
+commercial use permitted, no restrictions. See [NOTICE](NOTICE) for full
+attributions.
+
+Created and maintained by [Hugo L. Espuny](https://github.com/fakehec),
+with contributions acknowledged in [AUTHORS.md](AUTHORS.md).
+
+## ☕ Community
+
+If you want to follow the project or get involved:
+
+- ⭐ Star this repo to help discoverability.
+- 🐛 Report issues via the [issue tracker](../../issues).
+- 💬 Join the conversation in [Discussions](../../discussions).
+- 📰 Technical posts at [blog.uttera.ai](https://blog.uttera.ai).
+- 🌐 Uttera Cloud: [https://uttera.ai](https://uttera.ai) (EU-hosted,
+  solar-powered, subscription flat-rate).
 
 ---
 
