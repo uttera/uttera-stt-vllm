@@ -134,6 +134,8 @@ See [NOTICE](NOTICE) for full attributions.
 
 ---
 
-*Uttera /ˈʌt.ər.ə/ — from the English verb "to utter" (to speak aloud).
-Also the backronym **U**niversal **T**ext **T**ransformer **E**ngine for
-**R**ealtime **A**udio.*
+*Uttera /ˈʌt.ər.ə/ — from the English verb "to utter" (to speak aloud, to
+pronounce, to give audible expression to). Formally, the name is a backronym
+of **U**niversal **T**ext **T**ransformer **E**ngine for **R**ealtime **A**udio
+— reflecting the project's origin as a STT/TTS server and its underlying
+Transformer architecture.*
