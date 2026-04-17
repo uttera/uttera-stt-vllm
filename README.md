@@ -22,11 +22,20 @@ Whisper-large-v3-turbo today, room for future Transformer STT backends.
 - You transcribe hours of audio per day across many concurrent streams.
 - You want continuous batching to maximise GPU utilisation.
 - You have large-VRAM GPUs dedicated to inference.
+- **You have 32 GB+ of VRAM** (vLLM reserves ~22–29 GB at startup
+  depending on `gpu_memory_utilization`; below 32 GB total you either
+  run out of headroom or lose the batching advantage that justifies
+  the reservation).
 
 **Choose `uttera-stt-hotcold` when**:
 - You have consumer GPUs (RTX 4070, 4080) and transcribe occasionally.
 - Personal or single-user deployment.
 - You want to share the GPU with other workloads.
+- **You have 8–24 GB of VRAM.** vLLM does not fit comfortably in this
+  range: at 8–16 GB the KV cache is too small for continuous batching
+  to beat hotcold; at 16–24 GB vLLM works but reserves 11–22 GB
+  permanently, wasting the co-location flexibility that is hotcold's
+  reason to exist on mid-sized GPUs.
 
 ## Architecture
 
