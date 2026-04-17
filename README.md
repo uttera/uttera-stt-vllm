@@ -136,4 +136,4 @@ See [NOTICE](NOTICE) for full attributions.
 
 *Uttera /ˈʌt.ər.ə/ — from the English verb "to utter" (to speak aloud).
 Also the backronym **U**niversal **T**ext **T**ransformer **E**ngine for
-**R**ealtime **A**I.*
+**R**ealtime **A**udio.*
