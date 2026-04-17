@@ -39,6 +39,11 @@ Whisper-large-v3-turbo today, room for future Transformer STT backends.
   permanently, wasting the co-location flexibility that is hotcold's
   reason to exist on mid-sized GPUs.
 
+See [`uttera-benchmarks`](https://github.com/uttera/uttera-benchmarks)
+for reproducible head-to-head numbers across four load profiles
+(latency, burst up to N=1024, sustained) and two corpora (LibriSpeech
+test-clean and an internal Spanish WAV corpus).
+
 ## Architecture
 
 Built on [vLLM](https://github.com/vllm-project/vllm) (native Whisper
