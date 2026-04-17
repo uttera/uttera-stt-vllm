@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-04-17
+
+First stable release. Functionally complete, lint- and structure-verified
+via CI, benchmarked against a sibling hot/cold Whisper implementation on
+LibriSpeech and an internal Spanish corpus. Suitable for cloud/multi-tenant
+STT deployments on single GPUs with ≥32 GB VRAM.
+
+### Added
+- **GitHub Actions CI** (`.github/workflows/ci.yml`) with two always-on
+  jobs (ruff lint + module syntax + endpoint declaration check) and one
+  optional GPU smoke job gated to self-hosted runners.
+- **Positioning section** in `README.md` with explicit VRAM thresholds
+  and a pointer to the sibling [`uttera-stt-hotcold`](https://github.com/uttera/uttera-stt-hotcold)
+  for 8–24 GB deployments.
+- **Published reproducible benchmarks** at [`uttera-benchmarks`](https://github.com/uttera/uttera-benchmarks):
+  - 18.19 rps sustained on burst N=1024 (zero failures) against
+    LibriSpeech test-clean.
+  - 18.19 rps on the internal Spanish WAV corpus (clips 13–27 s, zero
+    failures) — duration-insensitive, unlike the hotcold sibling which
+    saturates at N=1024 on the same corpus.
+  - Single-request p50 of 82 ms on ~14 s LibriSpeech clips, 120 ms on
+    ~20 s Spanish clips.
+
+### Changed
+- **`SERVER_VERSION` bumped to `1.0.0`.** Reflected in `/health`,
+  `/v1/models`, and the FastAPI app metadata.
+- **`requirements.txt`** now pins `vllm[audio]>=0.19.0,<0.20.0` (was
+  plain `vllm`). The `[audio]` extra pulls in `resampy`, `av`, `scipy`,
+  `soundfile`, and `mistral_common[audio]`, without which
+  `/v1/audio/transcriptions` raises HTTP 500 on every request because
+  vLLM's internal `load_audio()` cannot resample to 16 kHz.
+
+### Fixed
+- Import paths updated to the real vLLM 0.19 layout:
+  - `TranscriptionRequest` / `TranslationRequest` now imported from
+    `vllm.entrypoints.openai.speech_to_text.protocol` (was the
+    non-existent `vllm.entrypoints.openai.protocol`).
+  - `OpenAIServingModels` / `BaseModelPath` from
+    `vllm.entrypoints.openai.models.serving` (was the non-existent
+    `vllm.entrypoints.openai.serving_models`).
+- Dropped `task="transcription"` from `AsyncEngineArgs`: vLLM 0.19
+  infers the runner from the Whisper model architecture; the kwarg is
+  not accepted.
+- Dropped `model_config=...` from `OpenAIServingModels.__init__`;
+  vLLM 0.19 does not accept it.
+- Guarded `serving_models.init_static_loras()` behind `hasattr` so the
+  code tolerates the method being dropped in a future vLLM patch.
+
+### Known limitations
+- **`openai/whisper-large-v3-turbo` does not support translation to
+  English.** Upstream HuggingFace model card: the turbo variant was
+  trained without the translation task. `/v1/audio/translations`
+  returns the transcription unchanged on turbo; for real translation,
+  set `WHISPER_MODEL=openai/whisper-large-v3`. This is a model-level
+  limitation, not a bug in this server.
+- The GPU smoke CI job is defined but gated off (`if: false`) because
+  no self-hosted GPU runner is configured yet.
+
 ## [0.1.0] - 2026-04-16
 
 First scaffold release. Pre-alpha — active development. Expect breaking

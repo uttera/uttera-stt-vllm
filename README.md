@@ -9,9 +9,10 @@
 High-throughput Speech-to-Text server built on **vLLM continuous batching**.
 Whisper-large-v3-turbo today, room for future Transformer STT backends.
 
-> **Status**: v0.1.0 — pre-alpha, active development. See
-> [ROADMAP.md](ROADMAP.md) for what's planned and [CHANGELOG.md](CHANGELOG.md)
-> for what has landed. API surface expected to stabilise at v1.0.0.
+> **Status**: v1.0.0 — first stable release. API surface is considered
+> stable; breaking changes will bump the major. See
+> [ROADMAP.md](ROADMAP.md) for upcoming features and
+> [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ## Positioning
 

@@ -11,7 +11,7 @@
 # See LICENSE and NOTICE for full terms and attributions.
 #
 # Package: uttera-stt-vllm
-# Version: 0.1.0
+# Version: 1.0.0
 # Maintainer: J.A.R.V.I.S. A.I., Hugo L. Espuny
 # Description: High-throughput Whisper STT server on vLLM continuous batching.
 #              A single Python process hosts vLLM's AsyncLLM engine; concurrency
@@ -19,6 +19,17 @@
 #              no per-request worker spawning, no shared work queue.
 #
 # CHANGELOG:
+# - 1.0.0 (2026-04-17): First stable release. Functionally complete and
+#   benchmarked against uttera-stt-hotcold on LibriSpeech and an internal
+#   Spanish corpus (see github.com/uttera/uttera-benchmarks). Added
+#   GitHub Actions CI (lint + structure + optional GPU smoke). Pinned
+#   vllm[audio] extra so resampy/av/soundfile are pulled in, without
+#   which /v1/audio/transcriptions raises HTTP 500. Import paths
+#   corrected to the actual vLLM 0.19 layout
+#   (vllm.entrypoints.openai.speech_to_text.protocol and
+#   vllm.entrypoints.openai.models.serving — not the names a research
+#   agent originally cited). Dropped task="transcription" and
+#   model_config= kwargs that vLLM 0.19 does not accept.
 # - 0.1.0 (2026-04-16): Initial scaffold. FastAPI app that embeds vLLM's
 #   AsyncLLM in-process with the stock OpenAIServingTranscription /
 #   OpenAIServingTranslation handlers. OpenAI-compatible endpoints for
@@ -26,7 +37,7 @@
 #   with uttera-stt-hotcold house style. Redis self-registration carried
 #   over from the sibling repo. Pre-release — active development.
 #
-# --- Architecture Summary (v0.1.0) ---
+# --- Architecture Summary (v1.0.0) ---
 #
 # * SINGLE-PROCESS ENGINE
 #   vllm.v1.engine.async_llm.AsyncLLM is instantiated once at startup
@@ -98,7 +109,7 @@ from vllm.v1.engine.async_llm import AsyncLLM  # noqa: E402
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "1.0.0"
 
 DEBUG = os.environ.get("DEBUG", "false").lower() in ("1", "true", "yes")
 logging.basicConfig(
