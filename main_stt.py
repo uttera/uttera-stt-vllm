@@ -11,7 +11,7 @@
 # See LICENSE and NOTICE for full terms and attributions.
 #
 # Package: uttera-stt-vllm
-# Version: 1.2.0
+# Version: 1.3.0
 # Maintainer: J.A.R.V.I.S. A.I., Hugo L. Espuny
 # Description: High-throughput Whisper STT server on vLLM continuous batching.
 #              A single Python process hosts vLLM's AsyncLLM engine; concurrency
@@ -19,6 +19,18 @@
 #              no per-request worker spawning, no shared work queue.
 #
 # CHANGELOG:
+# - 1.3.0 (2026-04-18): Default port migrated from 5000 → 9005 in
+#   lockstep with the sibling `uttera-stt-hotcold` v2.3.0. The Uttera
+#   stack now uses a canonical port scheme keyed by service family
+#   (STT=9005, TTS=9004) — the Gatekeeper routes to a single port per
+#   family regardless of which backend (hotcold / vllm) is behind it.
+#   Rationale: port 5000 has known collisions with macOS AirPlay
+#   Receiver (since Monterey) and with Docker Registry v2. The
+#   9000-9099 range is IANA "User Ports" without canonical assignment.
+#   Updated artefacts: `PORT` env default in main_stt.py, Dockerfile
+#   EXPOSE and CMD, docker-compose port mapping and healthcheck,
+#   .env.example, README + API.md, CI workflow. Migration: set
+#   `PORT=5000` in your env if you need to preserve the old endpoint.
 # - 1.2.0 (2026-04-18): OpenAI-compat polish sweep. Seven rough edges
 #   uncovered by the full endpoint validation run against v1.1.0 are
 #   now fixed. All backward-compatible; strict clients now get the
@@ -153,7 +165,7 @@ from vllm.v1.engine.async_llm import AsyncLLM  # noqa: E402
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.3.0"
 
 # Valid response formats per OpenAI spec. vLLM's own handler natively
 # supports json/text/verbose_json but rejects srt/vtt; we always request
@@ -212,7 +224,7 @@ LIBRETRANSLATE_TIMEOUT_S = float(os.environ.get("LIBRETRANSLATE_TIMEOUT_S", "30"
 # Redis self-registration (opt-in). If REDIS_URL is unset, publishing is skipped.
 REDIS_URL = os.environ.get("REDIS_URL", "")
 REDIS_NODE_HOST = os.environ.get("NODE_HOST", "localhost")
-REDIS_NODE_PORT = int(os.environ.get("NODE_PORT", "5000"))
+REDIS_NODE_PORT = int(os.environ.get("NODE_PORT", "9005"))
 REDIS_NODE_ID = os.environ.get("NODE_ID", "") or f"{REDIS_NODE_HOST}:{REDIS_NODE_PORT}"
 REDIS_KEY = f"stt:nodes:{REDIS_NODE_ID}"
 REDIS_PUBLISH_INTERVAL = float(os.environ.get("REDIS_PUBLISH_INTERVAL", "0.5"))
@@ -858,6 +870,6 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", "5000"))
+    port = int(os.environ.get("PORT", "9005"))
     host = os.environ.get("HOST", "0.0.0.0")
     uvicorn.run("main_stt:app", host=host, port=port, log_level="debug" if DEBUG else "info")

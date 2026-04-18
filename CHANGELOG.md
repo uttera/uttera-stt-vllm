@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-04-18
+
+### Changed
+
+- **Default port migrated from `5000` → `9005`** in lockstep with the
+  sibling `uttera-stt-hotcold` v2.3.0. Canonical Uttera-stack scheme:
+  STT services on `9005`, TTS services on `9004`. The Gatekeeper and
+  clients route by service family (STT/TTS) without needing to know
+  which backend (hotcold vs vllm) is active behind the port.
+
+  **Why move off `5000`:** collision with macOS AirPlay Receiver
+  (since Monterey) and with Docker Registry v2 default. The
+  `9000-9099` range is IANA "User Ports" without canonical
+  assignment and is collision-free on mainstream systems.
+
+  Artefacts updated: `PORT` env default in `main_stt.py`, `Dockerfile`
+  `EXPOSE`/`CMD`, `docker-compose.yml` port mapping and healthcheck,
+  `.env.example`, `README.md`, `API.md`, `.github/workflows/ci.yml`,
+  issue template health-probe URL.
+
+### Migration
+
+Deployments that already override `PORT` via env var: no change
+required. Deployments using the old default (`:5000`):
+- Repoint your Gatekeeper / reverse proxy at `:9005`.
+- Or set `PORT=5000` in your env to preserve the old endpoint.
+- Docker users: update your `-p` flag or `docker-compose.yml`.
+
+### Related
+
+- `uttera-stt-hotcold` v2.3.0 adopts the same `9005` port.
+- `uttera-tts-hotcold` v2.3.0 and `uttera-tts-vllm` v1.3.0 adopt
+  `9004` for the TTS pair.
+
 ## [1.2.0] - 2026-04-18
 
 OpenAI-compatibility polish sweep. Driven by a full endpoint validation
