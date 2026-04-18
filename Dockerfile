@@ -4,7 +4,7 @@
 # Build:
 #   docker build -t uttera-stt-vllm:0.1.0 .
 # Run (with GPU):
-#   docker run --gpus all --rm -p 5000:5000 \
+#   docker run --gpus all --rm -p 9005:9005 \
 #       -e WHISPER_MODEL=openai/whisper-large-v3-turbo \
 #       uttera-stt-vllm:0.1.0
 
@@ -38,10 +38,10 @@ RUN pip install --upgrade pip setuptools wheel \
 # Copy the rest of the project.
 COPY . /app/
 
-EXPOSE 5000
+EXPOSE 9005
 
 # Model cache defaults to assets/models/huggingface inside the image; mount a
 # volume there to persist downloads across container rebuilds.
 ENV XDG_CACHE_HOME=/app/assets/models
 
-CMD ["uvicorn", "main_stt:app", "--host", "0.0.0.0", "--port", "5000"]
+CMD ["uvicorn", "main_stt:app", "--host", "0.0.0.0", "--port", "9005"]

@@ -76,14 +76,14 @@ jobs:
           source venv/bin/activate
           WHISPER_MODEL=openai/whisper-large-v3-turbo \
           VLLM_GPU_MEM_UTIL=0.5 \
-            uvicorn main_stt:app --host 127.0.0.1 --port 5000 &
+            uvicorn main_stt:app --host 127.0.0.1 --port 9005 &
           for i in $(seq 1 90); do
             sleep 2
-            curl -sf http://127.0.0.1:5000/health | grep -q '"engine_ready":true' && break
+            curl -sf http://127.0.0.1:9005/health | grep -q '"engine_ready":true' && break
           done
       - name: Health check
         run: |
-          HEALTH=$(curl -s http://127.0.0.1:5000/health)
+          HEALTH=$(curl -s http://127.0.0.1:9005/health)
           echo "$HEALTH" | python3 -c "
           import json, sys
           d = json.load(sys.stdin)

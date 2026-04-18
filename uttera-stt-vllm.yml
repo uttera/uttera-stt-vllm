@@ -18,7 +18,7 @@ User=uttera
 Group=uttera
 WorkingDirectory=/opt/uttera-stt-vllm
 EnvironmentFile=-/opt/uttera-stt-vllm/.env
-ExecStart=/opt/uttera-stt-vllm/venv/bin/uvicorn main_stt:app --host 0.0.0.0 --port 5000
+ExecStart=/opt/uttera-stt-vllm/venv/bin/uvicorn main_stt:app --host 0.0.0.0 --port 9005
 Restart=on-failure
 RestartSec=5
 # vLLM can take a while to compile CUDA graphs on first boot; give it room.

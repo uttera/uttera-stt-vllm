@@ -94,13 +94,13 @@ cd uttera-stt-vllm
 cp .env.example .env      # tweak WHISPER_MODEL, VLLM_* if needed
 ./setup.sh                # creates venv, installs vLLM, pre-downloads the model
 source venv/bin/activate
-uvicorn main_stt:app --host 0.0.0.0 --port 5000
+uvicorn main_stt:app --host 0.0.0.0 --port 9005
 ```
 
 Then:
 
 ```bash
-curl -X POST http://localhost:5000/v1/audio/transcriptions \
+curl -X POST http://localhost:9005/v1/audio/transcriptions \
   -F "file=@sample.wav" \
   -F "language=es"
 ```
@@ -118,7 +118,7 @@ full surface. The most common overrides:
 | `VLLM_GPU_MEM_UTIL` | `0.9` | Fraction of VRAM vLLM is allowed to claim. |
 | `VLLM_MAX_NUM_SEQS` | `64` | Maximum in-flight sequences (batch size). |
 | `VLLM_MAX_MODEL_LEN` | `448` | Whisper context cap (tokens). |
-| `PORT` | `5000` | HTTP port. |
+| `PORT` | `9005` | HTTP port. |
 | `LIBRETRANSLATE_URL` | _(empty)_ | Base URL of a [LibreTranslate](https://libretranslate.com) instance. Required for `/v1/audio/translations` to work on a Whisper model without native translate (incl. turbo). |
 | `LIBRETRANSLATE_API_KEY` | _(empty)_ | Optional, only if your LibreTranslate instance enforces a key. |
 | `LIBRETRANSLATE_TIMEOUT_S` | `30` | Timeout for the translation call. |

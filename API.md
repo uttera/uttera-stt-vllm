@@ -2,7 +2,7 @@
 
 Uttera STT vLLM exposes an OpenAI-compatible speech-to-text surface. The full request/response shape is defined by vLLM's `speech_to_text` module (we forward requests verbatim); this document summarises the contract.
 
-Base URL (default): `http://localhost:5000`
+Base URL (default): `http://localhost:9005`
 
 ## `POST /v1/audio/transcriptions`
 
@@ -44,7 +44,7 @@ Transcribe audio in the **source language**. Mirrors OpenAI's `/v1/audio/transcr
 **Example**:
 
 ```bash
-curl -X POST http://localhost:5000/v1/audio/transcriptions \
+curl -X POST http://localhost:9005/v1/audio/transcriptions \
   -F "file=@sample.wav" \
   -F "language=es" \
   -F "response_format=json"
@@ -70,16 +70,16 @@ Implementation: Whisper transcribes in the source language (auto-detected or for
 
 ```bash
 # OpenAI-default behaviour: Spanish → English
-curl -X POST http://localhost:5000/v1/audio/translations \
+curl -X POST http://localhost:9005/v1/audio/translations \
   -F "file=@spanish-clip.wav"
 
 # Spanish → French
-curl -X POST http://localhost:5000/v1/audio/translations \
+curl -X POST http://localhost:9005/v1/audio/translations \
   -F "file=@spanish-clip.wav" \
   -F "to_language=fr"
 
 # Same source and target — LibreTranslate is skipped, transcription returned
-curl -X POST http://localhost:5000/v1/audio/translations \
+curl -X POST http://localhost:9005/v1/audio/translations \
   -F "file=@spanish-clip.wav" \
   -F "to_language=es"
 ```
