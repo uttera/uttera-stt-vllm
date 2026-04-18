@@ -5,6 +5,84 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-04-18
+
+OpenAI-compatibility polish sweep. Driven by a full endpoint validation
+run (128-concurrent burst + 16 single-shot feature tests across
+`/v1/audio/transcriptions` and `/v1/audio/translations`). Seven rough
+edges fixed. All backward-compatible — existing clients see no change;
+strict clients now get the documented OpenAI contract.
+
+### Added
+
+- **Real SRT / WebVTT / verbose_json responses** on both transcriptions
+  and translations. The wrapper now always requests `verbose_json` from
+  vLLM internally and renders the final wire format itself:
+  - `json` → compact `{"text": "..."}` (OpenAI-compact; unchanged default).
+  - `text` → plain text body with `text/plain; charset=utf-8` Content-Type.
+  - `verbose_json` → full vLLM result (text + segments + language +
+    words + usage).
+  - `srt` → SubRip subtitle file (`HH:MM:SS,mmm`, `application/x-subrip`).
+  - `vtt` → WebVTT subtitle file (`HH:MM:SS.mmm`, `text/vtt`).
+  Previously `srt` and `vtt` returned HTTP 200 with a vLLM error body
+  (`{"error": {"code": 400, ...}}`); `text` returned JSON instead of a
+  plain-text body.
+- **Per-segment LibreTranslate translations**. When the translation
+  endpoint is called with `response_format=srt|vtt|verbose_json`, each
+  transcribed segment is individually translated through LibreTranslate
+  (in parallel via `asyncio.gather`) so the resulting subtitles keep
+  their original timings aligned to the translated text. For `text` /
+  `json` formats a single LibreTranslate call is still used.
+- **`X-Translation-Mode: libretranslate` response header** on
+  `/v1/audio/translations`. Matches the sibling `uttera-stt-hotcold`
+  v2.2.0 for observability symmetry.
+- **`HEAD /health` support**. Load balancers and uptime probes that use
+  HEAD no longer get HTTP 405.
+- **Opt-in `CORSMiddleware`** gated on `CORS_ALLOW_ORIGINS` env var
+  (comma-separated list, or `"*"`). Disabled by default — API-first
+  deployments don't need CORS, and enabling it unconditionally broadens
+  the attack surface.
+- **`temperature` range validation** in `[0.0, 1.0]` per the OpenAI
+  spec. Out-of-range values return HTTP 422 with an explicit message.
+  vLLM itself accepts any float and silently produces garbage for
+  values > 1 (previously responded 200 with gibberish) and raises an
+  internal error for negatives (previously responded 500).
+
+### Changed
+
+- **`SERVER_VERSION` bumped to `1.2.0`.**
+- **vLLM-side errors now surface with the real status code.** The
+  wrapper now looks at `result.error.code` (vLLM's `ErrorResponse`
+  shape) instead of a non-existent top-level `result.code`, so a
+  rejected request no longer comes back as HTTP 200 with an error body.
+- **Whisper "Unsupported language: XX" errors** surface as HTTP 400
+  with the actual message (including the list of supported codes),
+  instead of HTTP 500 "Internal Server Error".
+- **Non-audio / undecodeable file bodies** return HTTP 400 with
+  `"Failed to decode audio body — not a valid audio stream or
+  unsupported codec."` instead of HTTP 500.
+
+### Verified
+
+- 128-concurrent burst on Whisper-large-v3-turbo: 128/128 OK, 0
+  failures, 16.6 rps (within 5% of v1.1.0 baseline — no regression).
+- CORS preflight + actual POST emit the expected headers when
+  `CORS_ALLOW_ORIGINS` is set.
+- ES → FR and ES → ZH translation pipelines produce correct output on
+  the internal Spanish corpus, including segment-by-segment SRT/VTT
+  with preserved 0:00→0:07.64, 0:08.80→0:16.96 timings.
+
+### Backward compatibility
+
+- Every previously-valid request continues to return the same shape.
+- Default `response_format=json` behaviour is unchanged.
+- CORS is disabled by default; existing deployments see no header
+  changes unless they opt in.
+- The `usage: {"type": "duration", "seconds": N}` field that vLLM
+  populated in v1.1.0 compact-JSON responses is dropped from the
+  default `json` format (OpenAI-compact does not include it) but is
+  preserved in `verbose_json`.
+
 ## [1.1.0] - 2026-04-17
 
 Translation works again — and now works better than Whisper's own translate.

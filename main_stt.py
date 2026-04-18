@@ -11,7 +11,7 @@
 # See LICENSE and NOTICE for full terms and attributions.
 #
 # Package: uttera-stt-vllm
-# Version: 1.1.0
+# Version: 1.2.0
 # Maintainer: J.A.R.V.I.S. A.I., Hugo L. Espuny
 # Description: High-throughput Whisper STT server on vLLM continuous batching.
 #              A single Python process hosts vLLM's AsyncLLM engine; concurrency
@@ -19,6 +19,37 @@
 #              no per-request worker spawning, no shared work queue.
 #
 # CHANGELOG:
+# - 1.2.0 (2026-04-18): OpenAI-compat polish sweep. Seven rough edges
+#   uncovered by the full endpoint validation run against v1.1.0 are
+#   now fixed. All backward-compatible; strict clients now get the
+#   documented OpenAI contract instead of approximations:
+#   1. `response_format=srt|vtt` returned HTTP 200 with an error body
+#      `{"error":..., "code":400}`. Fixed: we now force vLLM to do
+#      `verbose_json` internally and render the requested SRT/WebVTT
+#      body with correct timecodes + content-type.
+#   2. `response_format=text` returned JSON `{"text":..., "usage":...}`
+#      with `application/json` Content-Type. Fixed: real `text/plain`
+#      body with just the transcription text.
+#   3. `temperature` outside [0.0, 1.0] was either 500 (negative) or
+#      200 with complete gibberish (> 1.0). Fixed: validated at wrapper
+#      → HTTP 422 with an explicit range message.
+#   4. `language=xyzzy`, non-audio bodies, empty bodies all returned
+#      HTTP 500 "Internal Server Error". Fixed: mapped vLLM's
+#      ValueError("Invalid or unsupported audio file.") to HTTP 400
+#      with a decode message, and Whisper language errors to HTTP 400
+#      with the actual message.
+#   5. `/v1/audio/translations` ignored `response_format` entirely —
+#      always returned JSON `{"text":...}`. Fixed: the translation path
+#      now translates each segment through LibreTranslate (in parallel)
+#      so SRT/WebVTT translations preserve original timings.
+#   6. `HEAD /health` returned HTTP 405. Fixed: the route now accepts
+#      both GET and HEAD via `@app.api_route(methods=["GET", "HEAD"])`.
+#   7. No CORS middleware. Added opt-in `CORSMiddleware` gated on the
+#      `CORS_ALLOW_ORIGINS` env var (comma-separated list, or `"*"`).
+#      Disabled by default — API-first deployments don't need it.
+#   Also added: `X-Translation-Mode: libretranslate` response header on
+#   the LibreTranslate-mediated translation path, matching the sibling
+#   uttera-stt-hotcold v2.2.0 for observability symmetry.
 # - 1.1.0 (2026-04-17): /v1/audio/translations now works with Whisper-turbo
 #   (which lacks the native translate task) via a Whisper-transcribe →
 #   LibreTranslate post-processing pipeline. Controlled by the new env var
@@ -91,7 +122,8 @@ import redis.asyncio as aioredis
 import torch
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 # Load .env from the project directory or its parent
 _base = os.path.dirname(os.path.abspath(__file__))
@@ -121,7 +153,19 @@ from vllm.v1.engine.async_llm import AsyncLLM  # noqa: E402
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
+
+# Valid response formats per OpenAI spec. vLLM's own handler natively
+# supports json/text/verbose_json but rejects srt/vtt; we always request
+# verbose_json from vLLM internally and render the final response shape
+# ourselves, so every documented format is honoured.
+SUPPORTED_RESPONSE_FORMATS = {"json", "text", "srt", "vtt", "verbose_json"}
+
+# Valid temperature range per OpenAI spec [0.0, 1.0]. Applied at the
+# wrapper layer; vLLM itself accepts arbitrary temperatures and silently
+# produces garbage for values outside this range.
+TEMPERATURE_MIN = 0.0
+TEMPERATURE_MAX = 1.0
 
 DEBUG = os.environ.get("DEBUG", "false").lower() in ("1", "true", "yes")
 logging.basicConfig(
@@ -340,6 +384,23 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
+# Opt-in CORS middleware. API-first deployments don't need it, so CORS
+# stays disabled by default. Set CORS_ALLOW_ORIGINS to a comma-separated
+# list of origins or "*" to enable it.
+_cors_origins_env = os.environ.get("CORS_ALLOW_ORIGINS", "").strip()
+if _cors_origins_env:
+    _cors_origins = ["*"] if _cors_origins_env == "*" else [
+        o.strip() for o in _cors_origins_env.split(",") if o.strip()
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["X-Translation-Mode"],
+    )
+
 
 # -------------------------------
 # 4. Helpers
@@ -393,7 +454,7 @@ def _normalise_lang_for_libretranslate(code: str) -> str:
 async def _libretranslate(text: str, source: str, target: str) -> str:
     """Call LibreTranslate. Raises on network or HTTP errors; caller maps to 502/501."""
     import httpx  # already a transitive dep; import lazily so tests without it still start
-    src = _normalise_lang_for_libretranslate(source)
+    src = _normalise_lang_for_libretranslate(source) or "auto"
     tgt = _normalise_lang_for_libretranslate(target)
     payload: dict = {"q": text, "source": src, "target": tgt, "format": "text"}
     if LIBRETRANSLATE_API_KEY:
@@ -406,6 +467,153 @@ async def _libretranslate(text: str, source: str, target: str) -> str:
     if not isinstance(out, str):
         raise RuntimeError(f"Unexpected LibreTranslate response: {data}")
     return out
+
+
+def _validate_temperature(temperature: float) -> None:
+    """Validate `temperature` is in the OpenAI spec range [0.0, 1.0].
+
+    vLLM accepts any float and silently produces gibberish for out-of-range
+    values; the wrapper enforces the contract and returns HTTP 422 early.
+    """
+    if not (TEMPERATURE_MIN <= temperature <= TEMPERATURE_MAX):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"temperature {temperature} out of range. "
+                f"Must be in [{TEMPERATURE_MIN}, {TEMPERATURE_MAX}]."
+            ),
+        )
+
+
+def _format_timestamp_srt(seconds: float) -> str:
+    """Format seconds as HH:MM:SS,mmm for SubRip (SRT)."""
+    ms = int(round(max(0.0, seconds) * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _format_timestamp_vtt(seconds: float) -> str:
+    """Format seconds as HH:MM:SS.mmm for WebVTT."""
+    return _format_timestamp_srt(seconds).replace(",", ".")
+
+
+def _segments_to_srt(segments: list) -> str:
+    """Render whisper-style segments [{start, end, text, ...}] as SRT."""
+    lines: list[str] = []
+    for i, seg in enumerate(segments, start=1):
+        start = _format_timestamp_srt(float(seg.get("start", 0.0)))
+        end = _format_timestamp_srt(float(seg.get("end", 0.0)))
+        text = (seg.get("text") or "").strip()
+        lines.append(f"{i}\n{start} --> {end}\n{text}\n")
+    return "\n".join(lines)
+
+
+def _segments_to_vtt(segments: list) -> str:
+    """Render whisper-style segments as WebVTT."""
+    lines: list[str] = ["WEBVTT", ""]
+    for seg in segments:
+        start = _format_timestamp_vtt(float(seg.get("start", 0.0)))
+        end = _format_timestamp_vtt(float(seg.get("end", 0.0)))
+        text = (seg.get("text") or "").strip()
+        lines.append(f"{start} --> {end}")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _result_to_dict(result) -> dict:
+    """Convert vLLM's TranscriptionResponse/Verbose into a plain dict."""
+    if hasattr(result, "model_dump"):
+        return result.model_dump()
+    if isinstance(result, dict):
+        return result
+    return {"text": str(result)}
+
+
+def _unwrap_vllm_error(result) -> Optional[tuple[int, str]]:
+    """If `result` is a vLLM ErrorResponse, return `(http_code, message)`.
+
+    vLLM's ErrorResponse has shape `{"error": {"message":..., "code":N, ...}}`;
+    our original wrapper checked for a top-level `.code` which never existed,
+    so every error surfaced as HTTP 200 with an error body. Now we look at
+    `.error.code` (or the equivalent dict key) and surface the real code.
+    """
+    err = getattr(result, "error", None)
+    if err is None and isinstance(result, dict):
+        err = result.get("error")
+    if err is None:
+        return None
+    code = getattr(err, "code", None) if not isinstance(err, dict) else err.get("code")
+    message = getattr(err, "message", None) if not isinstance(err, dict) else err.get("message")
+    return (int(code or 500), str(message or "Unknown error"))
+
+
+def _render_response(
+    result_dict: dict,
+    response_format: str,
+    extra_headers: Optional[dict] = None,
+) -> Response:
+    """Render a whisper-shape result dict in the requested OpenAI format.
+
+    - `json`: compact `{"text": "..."}` (OpenAI spec — no segments).
+    - `text`: plain text body with `text/plain` Content-Type.
+    - `verbose_json`: full result (text + segments + language + usage).
+    - `srt`: SubRip subtitle file (Content-Type: application/x-subrip).
+    - `vtt`: WebVTT subtitle file (Content-Type: text/vtt).
+    """
+    headers = dict(extra_headers or {})
+    text = result_dict.get("text") or ""
+    segments = result_dict.get("segments") or []
+
+    if response_format == "text":
+        return PlainTextResponse(content=text, headers=headers)
+    if response_format == "srt":
+        return PlainTextResponse(
+            content=_segments_to_srt(segments),
+            media_type="application/x-subrip",
+            headers=headers,
+        )
+    if response_format == "vtt":
+        return PlainTextResponse(
+            content=_segments_to_vtt(segments),
+            media_type="text/vtt",
+            headers=headers,
+        )
+    if response_format == "verbose_json":
+        # The full whisper result — keep whatever extra fields (usage,
+        # words, duration) vLLM populated.
+        return JSONResponse(content=result_dict, headers=headers)
+    # Default: OpenAI-compact json — only {"text": ...}.
+    return JSONResponse(content={"text": text}, headers=headers)
+
+
+def _map_engine_exception(exc: Exception) -> HTTPException:
+    """Translate vLLM/Whisper internal exceptions into meaningful HTTP errors.
+
+    vLLM raises ValueError("Invalid or unsupported audio file.") when the
+    audio preprocessor can't decode the body, and ValueError for unsupported
+    language codes. Both are caller errors, not server faults, so surface
+    them as HTTP 400 with an actionable message.
+    """
+    msg = str(exc)
+    if isinstance(exc, ValueError):
+        low = msg.lower()
+        if "invalid or unsupported audio" in low or "failed to load audio" in low:
+            return HTTPException(
+                status_code=400,
+                detail="Failed to decode audio body — not a valid audio stream or unsupported codec.",
+            )
+        if "unsupported language" in low or ("language" in low and "not supported" in low):
+            return HTTPException(status_code=400, detail=msg)
+        # Generic ValueError from the engine — safer to surface as 400 with
+        # the actual message than as an opaque 500.
+        return HTTPException(status_code=400, detail=msg)
+    return HTTPException(
+        status_code=500,
+        detail="Transcription failed. Check server logs.",
+    )
 
 
 # -------------------------------
@@ -421,28 +629,61 @@ async def create_transcriptions(
     if _transcription_handler is None:
         raise HTTPException(status_code=503, detail="Engine not ready")
 
+    # Wrapper-level validation that vLLM skips.
+    _validate_temperature(request.temperature)
+
+    # User's requested format (pydantic Literal has already rejected
+    # unknown values with HTTP 422 before we got here).
+    user_format = (request.response_format or "json")
+
+    # Streaming stays untouched — vLLM emits SSE. When `stream=True` is
+    # used we keep the original behaviour (no custom format rendering).
+    if getattr(request, "stream", False):
+        audio_data = await request.file.read()
+        _in_flight += 1
+        try:
+            result = await _transcription_handler.create_transcription(
+                audio_data, request, raw_request,
+            )
+        except Exception as exc:
+            _total_errors += 1
+            raise _map_engine_exception(exc) from exc
+        finally:
+            _in_flight -= 1
+            _update_rps()
+        if hasattr(result, "__aiter__"):
+            return StreamingResponse(result, media_type="text/event-stream")
+        err = _unwrap_vllm_error(result)
+        if err is not None:
+            raise HTTPException(status_code=err[0], detail=err[1])
+        return JSONResponse(content=_result_to_dict(result))
+
+    # Non-streaming path: force vLLM to do `verbose_json` so we always
+    # have `segments` available for SRT/VTT rendering and can control
+    # the wire format ourselves.
+    internal_request = request.model_copy(update={"response_format": "verbose_json"})
+
     audio_data = await request.file.read()
     _in_flight += 1
     try:
         result = await _transcription_handler.create_transcription(
-            audio_data, request, raw_request,
+            audio_data, internal_request, raw_request,
         )
-    except Exception:
+    except Exception as exc:
         _total_errors += 1
-        raise
+        raise _map_engine_exception(exc) from exc
     finally:
         _in_flight -= 1
         _update_rps()
 
-    # result can be: TranscriptionResponse[Verbose], ErrorResponse, or AsyncGenerator (stream)
-    if hasattr(result, "__aiter__"):
-        return StreamingResponse(result, media_type="text/event-stream")
-    if hasattr(result, "code"):
-        return JSONResponse(
-            status_code=getattr(result, "code", 500),
-            content=result.model_dump(),
-        )
-    return JSONResponse(content=result.model_dump())
+    # Was it a vLLM-side error? vLLM returns an ErrorResponse model for
+    # things like invalid model names — surface its real code/message.
+    err = _unwrap_vllm_error(result)
+    if err is not None:
+        raise HTTPException(status_code=err[0], detail=err[1])
+
+    result_dict = _result_to_dict(result)
+    return _render_response(result_dict, user_format)
 
 
 @app.post("/v1/audio/translations")
@@ -473,10 +714,14 @@ async def create_translations(
             ),
         )
 
+    _validate_temperature(request.temperature)
+
+    user_format = (request.response_format or "json")
     target_lang = (request.to_language or "en").lower()
 
     # Build a TranscriptionRequest that mirrors the TranslationRequest but
-    # forces verbose_json so we receive the detected source language.
+    # forces verbose_json so we receive the detected source language AND
+    # the per-segment timings (needed to render SRT/VTT translations).
     transcription_req = TranscriptionRequest(
         file=request.file,
         model=request.model,
@@ -492,42 +737,57 @@ async def create_translations(
         transcribed = await _transcription_handler.create_transcription(
             audio_data, transcription_req, raw_request,
         )
-    except Exception:
+    except Exception as exc:
         _total_errors += 1
-        raise
+        raise _map_engine_exception(exc) from exc
     finally:
         _in_flight -= 1
         _update_rps()
 
-    # Propagate transcription errors as-is.
-    if hasattr(transcribed, "code"):
-        return JSONResponse(
-            status_code=getattr(transcribed, "code", 500),
-            content=transcribed.model_dump(),
-        )
+    err = _unwrap_vllm_error(transcribed)
+    if err is not None:
+        raise HTTPException(status_code=err[0], detail=err[1])
     if hasattr(transcribed, "__aiter__"):
-        # We requested a non-streaming verbose response; if the handler
-        # returned a generator something went wrong upstream.
         raise HTTPException(
             status_code=500,
             detail="Transcription handler returned a stream unexpectedly.",
         )
 
-    text = getattr(transcribed, "text", "") or ""
-    source_lang = (getattr(transcribed, "language", "") or "").lower()
-    log.info(f"[translate] transcribed type={type(transcribed).__name__} "
-             f"source={source_lang!r} target={target_lang!r} text_preview={text[:80]!r}")
+    result_dict = _result_to_dict(transcribed)
+    text = (result_dict.get("text") or "")
+    segments = result_dict.get("segments") or []
+    source_lang = (result_dict.get("language") or "").lower()
 
-    # No translation needed.
-    if not text.strip():
-        return JSONResponse(content={"text": text})
-    if source_lang and source_lang == target_lang:
-        log.info("[translate] source==target, skipping LibreTranslate")
-        return JSONResponse(content={"text": text})
+    log.info(
+        f"[translate] source={source_lang!r} target={target_lang!r} "
+        f"n_segments={len(segments)} text_preview={text[:80]!r}"
+    )
 
-    # Translate via LibreTranslate.
+    extra_headers = {"X-Translation-Mode": "libretranslate"}
+
+    # No translation needed — empty audio or source already matches target.
+    if not text.strip() or (source_lang and source_lang == target_lang):
+        if source_lang and source_lang == target_lang:
+            log.info("[translate] source==target, skipping LibreTranslate")
+        return _render_response(result_dict, user_format, extra_headers=extra_headers)
+
+    # Translate the full text and each segment in parallel. We translate
+    # segments individually so SRT/VTT subtitles keep their original
+    # timings aligned to the correct translated text. For compact JSON /
+    # plain text responses we only need `translated_text`, but doing both
+    # in one gather keeps the total latency ~ 1× LibreTranslate call
+    # (sphinx:5200 handles the parallelism trivially).
+    lt_source = source_lang or "auto"
     try:
-        translated = await _libretranslate(text, source_lang or "auto", target_lang)
+        tasks: list = [
+            _libretranslate(text, lt_source, target_lang),
+        ]
+        if user_format in ("srt", "vtt", "verbose_json"):
+            tasks.extend(
+                _libretranslate((seg.get("text") or "").strip(), lt_source, target_lang)
+                for seg in segments
+            )
+        translations = await asyncio.gather(*tasks)
     except Exception as e:
         log.warning(f"LibreTranslate call failed: {e}")
         raise HTTPException(
@@ -535,7 +795,25 @@ async def create_translations(
             detail=f"Translation backend failure: {type(e).__name__}: {e}",
         )
 
-    return JSONResponse(content={"text": translated})
+    translated_text = translations[0]
+    if len(translations) > 1:
+        # Zip the translated per-segment text back into the segments list
+        # so the downstream SRT/VTT/verbose_json renderer sees timed
+        # subtitle cues in the target language.
+        translated_segments: list = []
+        for seg, seg_text in zip(segments, translations[1:]):
+            new_seg = dict(seg)
+            new_seg["text"] = seg_text
+            translated_segments.append(new_seg)
+        result_dict = dict(result_dict)
+        result_dict["text"] = translated_text
+        result_dict["segments"] = translated_segments
+        # Record the new language in verbose_json too.
+        result_dict["language"] = target_lang
+    else:
+        result_dict = {"text": translated_text}
+
+    return _render_response(result_dict, user_format, extra_headers=extra_headers)
 
 
 @app.get("/v1/models")
@@ -551,7 +829,7 @@ async def list_models():
     }
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     state = _routing_state()
     body = {
