@@ -12,3 +12,9 @@ python-multipart
 python-dotenv
 redis[asyncio]>=5.0.0
 huggingface-hub
+
+# Prometheus /metrics endpoint — uses the default global registry.
+# Scrape with Telegraf's inputs.prometheus, Prometheus itself, or any
+# OpenMetrics-compatible consumer.
+prometheus-client>=0.20.0
+httpx>=0.27.0  # needed by the LibreTranslate post-processing path on /v1/audio/translations
