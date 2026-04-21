@@ -9,10 +9,15 @@
 High-throughput Speech-to-Text server built on **vLLM continuous batching**.
 Whisper-large-v3-turbo today, room for future Transformer STT backends.
 
-> **Status**: v1.1.0 — stable. `/v1/audio/translations` now works with
-> Whisper-turbo via a LibreTranslate post-processing pipeline and
-> supports arbitrary target languages (not just English). See
-> [CHANGELOG.md](CHANGELOG.md) and [ROADMAP.md](ROADMAP.md).
+> **Status**: v1.3.0 — stable. The API surface (endpoints, response
+> format contract, `X-Translation-Mode` header, canonical port `9005`)
+> is frozen under SemVer; no breaking changes inside `1.x`. v1.1.0
+> introduced the LibreTranslate pipeline (arbitrary target languages,
+> works on Whisper-turbo). v1.2.0 added real SRT / WebVTT /
+> verbose_json rendering, opt-in CORS, `HEAD /health`, `temperature`
+> validation, and mapped vLLM error codes to proper HTTP statuses.
+> v1.3.0 adopted the canonical Uttera-stack port `9005`.
+> See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## Positioning
 
@@ -59,13 +64,71 @@ support since v0.6.6). A **single Python process** hosts:
   `/v1/models`, `/health` — and carries the Redis self-registration
   protocol from the sibling repos.
 
-**What is *not* here**:
-- No hot/cold worker pool, no shared work queue, no subprocess spawning.
-- No hand-rolled audio preprocessing. vLLM does it and we do not second-guess.
+**What is here (current release)**:
 
-See [API.md](API.md) for endpoint details, [HISTORY.md](HISTORY.md) for
-why we have two STT repos, and [ROADMAP.md](ROADMAP.md) for what is in
-flight.
+*OpenAI-compatible API*
+- Standard endpoints: `POST /v1/audio/transcriptions`,
+  `POST /v1/audio/translations`.
+- `GET /v1/models` for client autodiscovery (reports `whisper-1`,
+  `owned_by: uttera`).
+- **All five OpenAI `response_format` values really supported**
+  (v1.2.0) — `json`, `text`, `verbose_json`, `srt`, `vtt`. The wrapper
+  requests `verbose_json` from vLLM internally and renders the final
+  wire format itself (proper `HH:MM:SS,mmm` SRT timecodes, WEBVTT
+  header, `text/plain` body for `text`, etc.). Previously `srt` / `vtt`
+  returned HTTP 200 with a vLLM error body; `text` returned JSON.
+
+*Translation pipeline*
+- **Whisper-transcribe → LibreTranslate** (v1.1.0). Works on any
+  Whisper variant including `large-v3-turbo` (which was trained
+  without the native `translate` task). Request field `to_language`
+  (default `"en"`) supports arbitrary LibreTranslate-covered targets.
+- **Per-segment translation for `srt` / `vtt` / `verbose_json`**
+  (v1.2.0) — each transcribed segment is translated individually (in
+  parallel via `asyncio.gather`) so subtitle timings stay aligned to
+  the translated text. `json` / `text` still use a single whole-text
+  call.
+- **`X-Translation-Mode: libretranslate`** response header on the
+  translation endpoint, exposed to browser clients via CORS.
+
+*Validation and error handling*
+- Strict validation — out-of-range returns HTTP 422 or HTTP 400 with
+  a useful detail body:
+  - `response_format` must be one of `json|text|verbose_json|srt|vtt`.
+  - `temperature` ∈ `[0.0, 1.0]` (OpenAI spec) — v1.2.0 added this;
+    vLLM alone accepts any float and silently produces garbage.
+  - Undecodeable / non-audio bodies → HTTP 400 with a typed decode
+    message (was HTTP 500 before v1.2.0).
+  - Unsupported Whisper language codes → HTTP 400 (was generic 500).
+  - LibreTranslate failure → HTTP 502 (no silent fallback to the
+    untranslated text — would leak source-language under a target-
+    language schema).
+
+*Operations*
+- `GET /health` **and `HEAD /health`** — liveness + throughput +
+  VRAM + routing snapshot. `HEAD` is useful for uptime probes that
+  don't parse JSON.
+- Opt-in `CORSMiddleware` via `CORS_ALLOW_ORIGINS` env var (disabled
+  by default — API-first deployments don't need CORS, and enabling
+  it unconditionally broadens the attack surface).
+- Canonical Uttera-stack port **`9005`** (STT family). TTS family
+  uses `9004`. Swapping `hotcold ↔ vllm` is a backend change, not
+  a port change.
+- Optional Redis self-registration (`REDIS_URL`) — same protocol as
+  the sibling `uttera-stt-hotcold` and TTS servers.
+
+**What is *not* here**:
+- No hot/cold worker pool, no shared work queue, no subprocess
+  spawning — vLLM's continuous batcher does all the scheduling.
+- No hand-rolled audio preprocessing. vLLM resamples to 16 kHz and
+  chunks at 30 s; we do not second-guess.
+- No `X-Route` response header — the sibling `uttera-stt-hotcold`
+  exposes one because it has lane variance (hot vs cold vs crossed).
+  Here every request goes through the same AsyncLLM, so there's
+  nothing to route.
+
+See [API.md](API.md) for endpoint details and [HISTORY.md](HISTORY.md)
+for why there are two STT repos.
 
 ## Benchmarks (preview)
 
@@ -82,9 +145,12 @@ Empirical results on 1× RTX 5090, Whisper-large-v3-turbo via vLLM 0.19,
 
 A **58-minute YouTube video** transcribed in **11.6 seconds** end-to-end.
 
-Bench harness in `tests/` pending port — see ROADMAP. The informal
-numbers above were captured on an earlier test harness that will be
-re-run and published in `tests/bench_400x.py`.
+The canonical head-to-head numbers (including the comparison against
+`uttera-stt-hotcold`) live in
+[`uttera-benchmarks`](https://github.com/uttera/uttera-benchmarks) —
+reproducible across latency, burst (up to N=1024), and sustained
+profiles on LibriSpeech test-clean and an internal Spanish WAV
+corpus.
 
 ## Quickstart
 

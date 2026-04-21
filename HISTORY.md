@@ -76,13 +76,29 @@ over their AI stack.
 
 ## Current status — April 2026
 
-These repositories are in transition. They are being renamed and moved
-to the [Uttera](https://uttera.ai) organization as part of the broader
-Uttera voice stack. The next major release will introduce a plugin
-architecture that supports multiple TTS/STT backends (Coqui XTTS-v2,
-VoxCPM2, and others to come) behind the same hot/cold worker pool.
+The repositories have completed their migration to the
+[Uttera](https://github.com/uttera) organization and are part of the
+broader [Uttera voice stack](https://uttera.ai). Four production
+servers ship today under that umbrella:
 
-The original design philosophy remains unchanged:
+- **`uttera-stt-vllm`** (*this repository*) — Whisper-large-v3-turbo
+  via vLLM's native speech path, single-process continuous batching.
+  Ideal for cloud, multi-tenant, large-VRAM GPUs (32 GB+).
+- **`uttera-stt-hotcold`** — STT sibling with a hot/cold worker pool
+  and optional LibreTranslate post-processing. Ideal for consumer
+  GPUs and home-lab deployments.
+- **`uttera-tts-hotcold`** — TTS sibling of `uttera-stt-hotcold`
+  with pluggable backends (Coqui XTTS-v2, VoxCPM2).
+- **`uttera-tts-vllm`** — TTS sibling of this repository, built on
+  `nano-vllm-voxcpm`'s continuous batcher (VoxCPM2-only by design).
+
+All four share a common health-check schema, Redis self-registration
+protocol, and sit behind the same
+[echo-gatekeeper](https://github.com/uttera) for tier gating, rate
+limits, and billing.
+
+The original design philosophy, set during the first hot/cold
+experiments, remains unchanged:
 
 - Respect the user's hardware
 - Respect the user's privacy
