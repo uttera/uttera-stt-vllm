@@ -11,7 +11,7 @@
 # See LICENSE and NOTICE for full terms and attributions.
 #
 # Package: uttera-stt-vllm
-# Version: 1.3.0
+# Version: 1.4.0
 # Maintainer: J.A.R.V.I.S. A.I., Hugo L. Espuny
 # Description: High-throughput Whisper STT server on vLLM continuous batching.
 #              A single Python process hosts vLLM's AsyncLLM engine; concurrency
@@ -19,6 +19,16 @@
 #              no per-request worker spawning, no shared work queue.
 #
 # CHANGELOG:
+# - 1.4.0 (2026-04-21): Prometheus `/metrics` endpoint. Exposes
+#   request counters (by endpoint/method/status), request duration
+#   histograms, in-flight gauge, engine-ready gauge, STT-specific
+#   counters (transcriptions by response_format, translations by
+#   mode+format), audio-seconds processed counter, per-op inference
+#   duration histograms (whisper_transcribe, libretranslate), error
+#   counters typed by cause, and a build_info gauge with version +
+#   engine + model labels. Scrape with Telegraf's inputs.prometheus
+#   or any OpenMetrics consumer. Additive — existing endpoints
+#   unchanged.
 # - 1.3.0 (2026-04-18): Default port migrated from 5000 → 9005 in
 #   lockstep with the sibling `uttera-stt-hotcold` v2.3.0. The Uttera
 #   stack now uses a canonical port scheme keyed by service family
@@ -136,6 +146,14 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # Load .env from the project directory or its parent
 _base = os.path.dirname(os.path.abspath(__file__))
@@ -165,7 +183,7 @@ from vllm.v1.engine.async_llm import AsyncLLM  # noqa: E402
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "1.3.0"
+SERVER_VERSION = "1.4.0"
 
 # Valid response formats per OpenAI spec. vLLM's own handler natively
 # supports json/text/verbose_json but rejects srt/vtt; we always request
@@ -250,6 +268,92 @@ _total_errors: int = 0
 
 _redis: Optional[aioredis.Redis] = None
 _redis_task: Optional[asyncio.Task] = None
+
+
+# -------------------------------
+# 2b. Prometheus metrics
+# -------------------------------
+#
+# Naming convention: `uttera_stt_<thing>`. Labels deliberately low-
+# cardinality — no request_id, no detected-language (unbounded), no
+# temperature. `endpoint` uses the fixed route list; anything off
+# that list is clamped to "other" so a drive-by scanner hitting
+# `/wp-admin` can't blow up label cardinality.
+
+_HTTP_REQUESTS_TOTAL = Counter(
+    "uttera_stt_requests_total",
+    "HTTP requests by endpoint, method and status code",
+    ["endpoint", "method", "status"],
+)
+
+_HTTP_REQUEST_DURATION = Histogram(
+    "uttera_stt_request_duration_seconds",
+    "HTTP request wall-clock duration in seconds",
+    ["endpoint", "method"],
+    buckets=(0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0),
+)
+
+_INFLIGHT_GAUGE = Gauge(
+    "uttera_stt_inflight_requests",
+    "Requests currently being processed by the engine",
+)
+
+_ENGINE_READY_GAUGE = Gauge(
+    "uttera_stt_engine_ready",
+    "1 if the Whisper engine is loaded and ready, 0 otherwise",
+)
+
+_LIBRETRANSLATE_CONFIGURED_GAUGE = Gauge(
+    "uttera_stt_libretranslate_configured",
+    "1 if LIBRETRANSLATE_URL is set and translations go through LibreTranslate; 0 if only the legacy vLLM-native translate path is available",
+)
+
+_TRANSCRIPTIONS_TOTAL = Counter(
+    "uttera_stt_transcriptions_total",
+    "Transcription requests broken down by requested response_format",
+    ["response_format"],            # json | text | verbose_json | srt | vtt
+)
+
+_TRANSLATIONS_TOTAL = Counter(
+    "uttera_stt_translations_total",
+    "Translation requests broken down by post-processing mode and response_format",
+    ["mode", "response_format"],    # mode in {libretranslate, native}
+)
+
+_AUDIO_SECONDS_TOTAL = Counter(
+    "uttera_stt_audio_seconds_total",
+    "Total seconds of audio successfully processed (useful as a billing / throughput proxy)",
+    ["endpoint"],                   # /v1/audio/transcriptions | /v1/audio/translations
+)
+
+_INFERENCE_DURATION = Histogram(
+    "uttera_stt_inference_duration_seconds",
+    "Per-call inference latency in seconds, by op",
+    ["op"],                         # whisper_transcribe | libretranslate
+    buckets=(0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+)
+
+_ERRORS_TOTAL = Counter(
+    "uttera_stt_errors_total",
+    "Errors by type",
+    ["type"],                       # decode | validation | upstream | model | libretranslate
+)
+
+_BUILD_INFO = Gauge(
+    "uttera_stt_build_info",
+    "Build metadata (label values carry version, engine, and served model id)",
+    ["version", "engine", "model"],
+)
+
+# Known HTTP routes — used to normalise the `endpoint` label so
+# cardinality stays bounded even if someone probes unknown paths.
+_KNOWN_ENDPOINTS = {
+    "/v1/audio/transcriptions",
+    "/v1/audio/translations",
+    "/v1/models",
+    "/health",
+    "/metrics",
+}
 
 
 # -------------------------------
@@ -412,6 +516,50 @@ if _cors_origins_env:
         allow_headers=["*"],
         expose_headers=["X-Translation-Mode"],
     )
+
+
+# Prometheus middleware — tracks every HTTP request generically.
+# Endpoint-specific labels (response_format, translation mode, audio
+# seconds) are attached inside the endpoint handlers for richer
+# breakdowns.
+
+class _PrometheusMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        method = request.method
+        # Don't self-meter — /metrics would otherwise tick every scrape.
+        if path == "/metrics":
+            return await call_next(request)
+        endpoint = path if path in _KNOWN_ENDPOINTS else "other"
+        t0 = time.monotonic()
+        status = 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            return response
+        finally:
+            elapsed = time.monotonic() - t0
+            _HTTP_REQUESTS_TOTAL.labels(
+                endpoint=endpoint, method=method, status=str(status)
+            ).inc()
+            _HTTP_REQUEST_DURATION.labels(
+                endpoint=endpoint, method=method
+            ).observe(elapsed)
+
+app.add_middleware(_PrometheusMiddleware)
+
+# Build_info is a static gauge — set once at module import time.
+_BUILD_INFO.labels(
+    version=SERVER_VERSION,
+    engine="vllm",
+    model=os.environ.get("WHISPER_MODEL", "openai/whisper-large-v3-turbo"),
+).set(1)
+# LibreTranslate gauge — set once from env config. The server's
+# behaviour doesn't change at runtime based on this; it's exposed
+# here so dashboards can distinguish the two translation paths.
+_LIBRETRANSLATE_CONFIGURED_GAUGE.set(
+    1 if os.environ.get("LIBRETRANSLATE_URL", "").strip() else 0
+)
 
 
 # -------------------------------
@@ -632,6 +780,21 @@ def _map_engine_exception(exc: Exception) -> HTTPException:
 # 5. Endpoints
 # -------------------------------
 
+@app.get("/metrics")
+async def metrics():
+    """Prometheus-format scrape endpoint.
+
+    Scrape with Telegraf's `inputs.prometheus` plugin, Prometheus
+    itself, or any OpenMetrics-compatible consumer. Cardinality is
+    bounded by design (fixed endpoint list, no per-request-id labels).
+    """
+    # Reflect current liveness state into the gauges on every scrape
+    # so they're always accurate without hooking every state transition.
+    _ENGINE_READY_GAUGE.set(1 if _engine_ready else 0)
+    _INFLIGHT_GAUGE.set(_in_flight)
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.post("/v1/audio/transcriptions")
 async def create_transcriptions(
     raw_request: Request,
@@ -647,26 +810,32 @@ async def create_transcriptions(
     # User's requested format (pydantic Literal has already rejected
     # unknown values with HTTP 422 before we got here).
     user_format = (request.response_format or "json")
+    _TRANSCRIPTIONS_TOTAL.labels(response_format=user_format).inc()
 
     # Streaming stays untouched — vLLM emits SSE. When `stream=True` is
     # used we keep the original behaviour (no custom format rendering).
     if getattr(request, "stream", False):
         audio_data = await request.file.read()
         _in_flight += 1
+        _INFLIGHT_GAUGE.inc()
         try:
-            result = await _transcription_handler.create_transcription(
-                audio_data, request, raw_request,
-            )
+            with _INFERENCE_DURATION.labels(op="whisper_transcribe").time():
+                result = await _transcription_handler.create_transcription(
+                    audio_data, request, raw_request,
+                )
         except Exception as exc:
             _total_errors += 1
+            _ERRORS_TOTAL.labels(type="model").inc()
             raise _map_engine_exception(exc) from exc
         finally:
             _in_flight -= 1
+            _INFLIGHT_GAUGE.dec()
             _update_rps()
         if hasattr(result, "__aiter__"):
             return StreamingResponse(result, media_type="text/event-stream")
         err = _unwrap_vllm_error(result)
         if err is not None:
+            _ERRORS_TOTAL.labels(type="upstream").inc()
             raise HTTPException(status_code=err[0], detail=err[1])
         return JSONResponse(content=_result_to_dict(result))
 
@@ -677,24 +846,37 @@ async def create_transcriptions(
 
     audio_data = await request.file.read()
     _in_flight += 1
+    _INFLIGHT_GAUGE.inc()
     try:
-        result = await _transcription_handler.create_transcription(
-            audio_data, internal_request, raw_request,
-        )
+        with _INFERENCE_DURATION.labels(op="whisper_transcribe").time():
+            result = await _transcription_handler.create_transcription(
+                audio_data, internal_request, raw_request,
+            )
     except Exception as exc:
         _total_errors += 1
+        _ERRORS_TOTAL.labels(type="model").inc()
         raise _map_engine_exception(exc) from exc
     finally:
         _in_flight -= 1
+        _INFLIGHT_GAUGE.dec()
         _update_rps()
 
     # Was it a vLLM-side error? vLLM returns an ErrorResponse model for
     # things like invalid model names — surface its real code/message.
     err = _unwrap_vllm_error(result)
     if err is not None:
+        _ERRORS_TOTAL.labels(type="upstream").inc()
         raise HTTPException(status_code=err[0], detail=err[1])
 
     result_dict = _result_to_dict(result)
+    # Tap audio duration for the billing/throughput counter.
+    _dur = result_dict.get("duration")
+    if _dur is None:
+        segs = result_dict.get("segments") or []
+        if segs and isinstance(segs[-1], dict):
+            _dur = segs[-1].get("end")
+    if isinstance(_dur, (int, float)) and _dur > 0:
+        _AUDIO_SECONDS_TOTAL.labels(endpoint="/v1/audio/transcriptions").inc(float(_dur))
     return _render_response(result_dict, user_format)
 
 
@@ -730,6 +912,7 @@ async def create_translations(
 
     user_format = (request.response_format or "json")
     target_lang = (request.to_language or "en").lower()
+    _TRANSLATIONS_TOTAL.labels(mode="libretranslate", response_format=user_format).inc()
 
     # Build a TranscriptionRequest that mirrors the TranslationRequest but
     # forces verbose_json so we receive the detected source language AND
@@ -745,27 +928,42 @@ async def create_translations(
 
     audio_data = await request.file.read()
     _in_flight += 1
+    _INFLIGHT_GAUGE.inc()
     try:
-        transcribed = await _transcription_handler.create_transcription(
-            audio_data, transcription_req, raw_request,
-        )
+        with _INFERENCE_DURATION.labels(op="whisper_transcribe").time():
+            transcribed = await _transcription_handler.create_transcription(
+                audio_data, transcription_req, raw_request,
+            )
     except Exception as exc:
         _total_errors += 1
+        _ERRORS_TOTAL.labels(type="model").inc()
         raise _map_engine_exception(exc) from exc
     finally:
         _in_flight -= 1
+        _INFLIGHT_GAUGE.dec()
         _update_rps()
 
     err = _unwrap_vllm_error(transcribed)
     if err is not None:
+        _ERRORS_TOTAL.labels(type="upstream").inc()
         raise HTTPException(status_code=err[0], detail=err[1])
     if hasattr(transcribed, "__aiter__"):
+        _ERRORS_TOTAL.labels(type="model").inc()
         raise HTTPException(
             status_code=500,
             detail="Transcription handler returned a stream unexpectedly.",
         )
 
     result_dict = _result_to_dict(transcribed)
+    # Tap audio duration (billing/throughput counter). Count against the
+    # translations endpoint since this is what the caller hit.
+    _dur = result_dict.get("duration")
+    if _dur is None:
+        _segs_probe = result_dict.get("segments") or []
+        if _segs_probe and isinstance(_segs_probe[-1], dict):
+            _dur = _segs_probe[-1].get("end")
+    if isinstance(_dur, (int, float)) and _dur > 0:
+        _AUDIO_SECONDS_TOTAL.labels(endpoint="/v1/audio/translations").inc(float(_dur))
     text = (result_dict.get("text") or "")
     segments = result_dict.get("segments") or []
     source_lang = (result_dict.get("language") or "").lower()
@@ -799,8 +997,10 @@ async def create_translations(
                 _libretranslate((seg.get("text") or "").strip(), lt_source, target_lang)
                 for seg in segments
             )
-        translations = await asyncio.gather(*tasks)
+        with _INFERENCE_DURATION.labels(op="libretranslate").time():
+            translations = await asyncio.gather(*tasks)
     except Exception as e:
+        _ERRORS_TOTAL.labels(type="libretranslate").inc()
         log.warning(f"LibreTranslate call failed: {e}")
         raise HTTPException(
             status_code=502,

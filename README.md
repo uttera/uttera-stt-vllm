@@ -190,6 +190,35 @@ full surface. The most common overrides:
 | `LIBRETRANSLATE_TIMEOUT_S` | `30` | Timeout for the translation call. |
 | `REDIS_URL` | _(empty)_ | Optional; enables self-registration for a router. |
 
+## Observability (`/metrics`)
+
+`GET /metrics` returns Prometheus-format metrics for direct scraping
+by Prometheus, Telegraf's `inputs.prometheus` plugin, or any other
+OpenMetrics-compatible consumer. All metrics are prefixed with
+`uttera_stt_` and use low-cardinality labels.
+
+```toml
+[[inputs.prometheus]]
+  urls = ["http://stt-host:9005/metrics"]
+  interval = "15s"
+```
+
+Key series:
+
+| Metric | Type | Use |
+|---|---|---|
+| `uttera_stt_requests_total{endpoint,method,status}` | Counter | Per-endpoint request rate + status mix |
+| `uttera_stt_request_duration_seconds{endpoint,method}` | Histogram | HTTP p50/p95/p99 (total RTT) |
+| `uttera_stt_inflight_requests` | Gauge | Live load |
+| `uttera_stt_transcriptions_total{response_format}` | Counter | Traffic mix across the five response formats |
+| `uttera_stt_translations_total{mode,response_format}` | Counter | Translation path breakdown |
+| `uttera_stt_audio_seconds_total{endpoint}` | Counter | Audio seconds processed (billing / throughput proxy) |
+| `uttera_stt_inference_duration_seconds{op}` | Histogram | Per-call model latency (`whisper_transcribe` / `libretranslate`) — separates GPU time from external-dependency time |
+| `uttera_stt_engine_ready` | Gauge | 1 if the vLLM engine is loaded + warmed up |
+| `uttera_stt_libretranslate_configured` | Gauge | 1 if `LIBRETRANSLATE_URL` was set at startup |
+| `uttera_stt_errors_total{type}` | Counter | Typed errors (`upstream` / `model` / `libretranslate`) |
+| `uttera_stt_build_info{version,engine,model}` | Gauge | Version + model in the field (value always `1`) |
+
 ## Deployment
 
 - **Docker**: `docker compose up -d` (GPU passthrough configured in

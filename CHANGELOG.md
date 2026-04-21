@@ -5,6 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-04-21
+
+Prometheus `/metrics` endpoint. Additive only — all existing
+endpoints unchanged.
+
+### Added
+
+- **`GET /metrics`** — OpenMetrics-format scrape endpoint using the
+  default `prometheus_client` global registry. Scrape with Telegraf's
+  `inputs.prometheus` plugin, Prometheus itself, or any other
+  OpenMetrics-compatible consumer.
+- **HTTP-level metrics** (bounded cardinality — unknown paths fall
+  into `"other"`):
+  - `uttera_stt_requests_total{endpoint, method, status}` — Counter
+    of HTTP requests.
+  - `uttera_stt_request_duration_seconds{endpoint, method}` —
+    Histogram of HTTP RTT, buckets 25 ms → 60 s.
+  - `uttera_stt_inflight_requests` — Gauge reflecting `_in_flight`.
+- **STT-specific metrics**:
+  - `uttera_stt_transcriptions_total{response_format}` — Counter
+    broken down by the requested `response_format` (`json`, `text`,
+    `verbose_json`, `srt`, `vtt`).
+  - `uttera_stt_translations_total{mode, response_format}` — Counter
+    broken down by translation path (`libretranslate` — all traffic
+    today — plus the `response_format` for output shape).
+  - `uttera_stt_audio_seconds_total{endpoint}` — Counter summing
+    the audio seconds successfully processed. Useful as a billing /
+    throughput proxy; tapped from the duration field in every
+    successful `verbose_json` response.
+  - `uttera_stt_inference_duration_seconds{op}` — Histogram per
+    model call kind: `whisper_transcribe` (vLLM Whisper call) and
+    `libretranslate` (the LibreTranslate HTTP round-trip). Lets
+    dashboards show GPU time vs external-dependency time separately.
+- **State gauges** (refreshed on every `/metrics` scrape so they're
+  always current):
+  - `uttera_stt_engine_ready` — 1 when the vLLM engine has passed
+    warmup, 0 otherwise.
+  - `uttera_stt_libretranslate_configured` — 1 if `LIBRETRANSLATE_URL`
+    was set at startup, 0 otherwise.
+- **`uttera_stt_errors_total{type}`** — Counter of errors by cause.
+  Types: `upstream` (vLLM returned an ErrorResponse — mapped to the
+  real HTTP code), `model` (uncaught inference exception),
+  `libretranslate` (LibreTranslate HTTP/network failure). Generic
+  4xx failures are already visible via the `status` label on
+  `requests_total`.
+- **`uttera_stt_build_info{version, engine, model}`** — Gauge set
+  to `1` with the running `SERVER_VERSION`, engine (`vllm`), and
+  the actual `WHISPER_MODEL` as labels, so dashboards can show
+  "version + model in the field" without a separate lookup.
+
+### Changed
+
+- **New runtime dep**: `prometheus-client>=0.20.0`. Fully self-
+  contained; uses the default global registry.
+- **`SERVER_VERSION` bumped to `1.4.0`.**
+- **New runtime dep**: `httpx>=0.27.0` pinned in requirements.txt
+  (was previously pulled in only transitively from vllm[audio];
+  making it explicit so the LibreTranslate path doesn't break if
+  vllm drops the transitive dep in a future release).
+
+### Not changed
+
+- `/v1/audio/transcriptions`, `/v1/audio/translations`, `/v1/models`,
+  `/health` behave identically to v1.3.0. The `/health` body still
+  reports `in_flight` / `total_completed` / `total_errors` for
+  callers that have them hardcoded; the Prometheus counters are the
+  new canonical observability path.
+
 ## [1.3.0] - 2026-04-18
 
 ### Changed
