@@ -131,28 +131,25 @@ curl -X POST http://localhost:9005/v1/audio/translations \
 
 ## `GET /health` and `HEAD /health`
 
-Liveness + throughput + routing signal. Responds `200` when the
-engine is ready, `503` during startup or after a fatal engine error.
-`HEAD` returns the same headers with an empty body — useful for
+Liveness + throughput. Responds `200` when the engine is ready, `503`
+during startup, after a fatal engine error, or while the circuit breaker
+is open. `HEAD` returns the same headers with an empty body — useful for
 uptime probes that don't want to parse JSON.
 
 ```json
 {
   "status": "ok",
-  "version": "1.3.0",
+  "version": "1.5.0",
   "engine": "vllm",
   "model": "openai/whisper-large-v3-turbo",
   "served_as": "whisper-1",
   "engine_ready": true,
   "engine_error": null,
-  "routing": {
-    "load_score": 0.12,
-    "accepts_requests": true
-  },
   "metrics": {
     "in_flight": 8,
     "total_completed": 1042,
     "total_errors": 0,
+    "consecutive_engine_failures": 0,
     "ema_rps": 17.4,
     "vram_free_gb": 18.23,
     "max_num_seqs": 64,
@@ -162,8 +159,10 @@ uptime probes that don't want to parse JSON.
 }
 ```
 
-The `routing` block matches `uttera-stt-hotcold`'s `/health` so a
-shared upstream router can consume both backends with one schema.
+`engine_ready` is `false` (and the endpoint returns `503`) while the model
+is still loading or after the circuit breaker has opened on repeated engine
+failures; `engine_error` then carries the reason. Point a monitor or load
+balancer at `/health` to route around an unhealthy instance.
 
 ## Streaming
 
@@ -178,8 +177,7 @@ a non-streaming feature.
 ## CORS
 
 Disabled by default — this server is API-first, typically consumed
-by backend-to-backend callers or served through the Uttera
-gatekeeper.
+by backend-to-backend callers or served behind a reverse proxy.
 
 To enable browser-origin access, set `CORS_ALLOW_ORIGINS` to a
 comma-separated list of origins (or `*` for permissive):
@@ -197,6 +195,5 @@ explicitly exposed so browser clients can read it from JavaScript.
 
 ## Authentication
 
-No authentication in this repo by design. Deploy behind the Uttera
-gatekeeper (or any reverse proxy) for API keys, quotas, and rate
-limits.
+No authentication in this repo by design. Deploy behind a reverse
+proxy or API gateway for API keys, quotas, and rate limits.

@@ -11,7 +11,7 @@
 # See LICENSE and NOTICE for full terms and attributions.
 #
 # Package: uttera-stt-vllm
-# Version: 1.4.0
+# Version: 1.5.0
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-throughput Whisper STT server on vLLM continuous batching.
 #              A single Python process hosts vLLM's AsyncLLM engine; concurrency
@@ -19,6 +19,39 @@
 #              no per-request worker spawning, no shared work queue.
 #
 # CHANGELOG:
+# - 1.5.0 (2026-09-24): Robustness sweep, mirroring hardening applied to the
+#   private Uttera deployment. Five additions, all env-gated and safe by
+#   default:
+#   1. Optional frozen-model mode. Set UTTERA_OFFLINE=1 and the server sets
+#      HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE / MODELSCOPE_OFFLINE before the ML
+#      libraries import, so a validated model never silently re-downloads or
+#      changes after a reboot. Online by default (a fresh install can fetch).
+#   2. Voice-activity gate (VAD). Whisper hallucinates text on silence
+#      (learned "Thank you."/"Gracias." from subtitle training data); the gate
+#      returns an empty transcription when the whole clip has no speech, and on
+#      any doubt transcribes normally. Silero JIT model, CPU, decides 30 s in
+#      milliseconds. Env: VAD_ENABLED, VAD_THRESHOLD, VAD_JIT, VAD_STRIDE.
+#      Requires the `silero-vad` package; degrades gracefully if absent.
+#   3. Engine circuit breaker. N consecutive engine (5xx) failures flip the
+#      server to not-ready so /health returns 503; a later success clears it.
+#      Only 5xx count — 4xx (unreadable audio, unsupported language) are the
+#      caller's fault and never open it. Env: ENGINE_FAIL_THRESHOLD.
+#   4. Recovery self-probe. While the breaker is open, an in-process probe
+#      (a synthetic tone, via httpx ASGITransport — no network) retries every
+#      ENGINE_PROBE_SECONDS and auto-clears the breaker on success, so a
+#      transient fault doesn't need a manual restart.
+#   5. Correct HTTP status codes instead of a blanket 500: oversized upload →
+#      413, text over the model's context → 413, GPU OOM → 503 (busy, not
+#      broken; excluded from the breaker), malformed JSON → 400. Env:
+#      MAX_FILESIZE_MB (default 250). Tracebacks are stripped from error
+#      bodies. `consecutive_engine_failures` is now reported in /health.
+#   Removed: the optional Redis self-registration (this server is now
+#   standalone — one process, one model, an OpenAI-compatible API and a
+#   /health); the /health `routing` block went with it.
+#   Requires vLLM >= 0.24 (was 0.19.x): clears four published advisories in the
+#   0.19 line (incl. a critical auth bypass) and follows the speech-to-text
+#   handlers to their entrypoints.speech_to_text.* import path. See
+#   requirements.txt for the sm_120/Blackwell FlashInfer note.
 # - 1.4.0 (2026-04-21): Prometheus `/metrics` endpoint. Exposes
 #   request counters (by endpoint/method/status), request duration
 #   histograms, in-flight gauge, engine-ready gauge, STT-specific
@@ -30,10 +63,8 @@
 #   or any OpenMetrics consumer. Additive — existing endpoints
 #   unchanged.
 # - 1.3.0 (2026-04-18): Default port migrated from 5000 → 9005 in
-#   lockstep with the sibling `uttera-stt-hotcold` v2.3.0. The Uttera
-#   stack now uses a canonical port scheme keyed by service family
-#   (STT=9005, TTS=9004) — the Gatekeeper routes to a single port per
-#   family regardless of which backend (hotcold / vllm) is behind it.
+#   lockstep with the sibling `uttera-stt-hotcold` v2.3.0, so both STT
+#   backends expose the same default port and are drop-in swappable.
 #   Rationale: port 5000 has known collisions with macOS AirPlay
 #   Receiver (since Monterey) and with Docker Registry v2. The
 #   9000-9099 range is IANA "User Ports" without canonical assignment.
@@ -99,8 +130,7 @@
 #   AsyncLLM in-process with the stock OpenAIServingTranscription /
 #   OpenAIServingTranslation handlers. OpenAI-compatible endpoints for
 #   transcription and translation, custom /health and /v1/models aligned
-#   with uttera-stt-hotcold house style. Redis self-registration carried
-#   over from the sibling repo. Pre-release — active development.
+#   with uttera-stt-hotcold house style. Pre-release — active development.
 #
 # --- Architecture Summary (v1.1.0) ---
 #
@@ -119,28 +149,41 @@
 #   lifespan and dispatch each request to their create_transcription /
 #   create_translation coroutines.
 #
-# * OPTIONAL REDIS SELF-REGISTRATION
-#   If REDIS_URL is set, the server publishes {load_score,
-#   accepts_requests, host, port, version, ts} to stt:nodes:{NODE_ID}
-#   with a short TTL on a background tick, matching the sibling repos
-#   so a front-end router can discover all Uttera nodes uniformly.
-#
 # * WHAT IS *NOT* HERE (vs. uttera-stt-hotcold)
 #   - cold_worker.py — vLLM has no worker subprocess concept.
 #   - Work queue, hot/cold loops, pool manager, VRAM pre-checks,
 #     COLD_POOL_SIZE / HOT_QUEUE_SAFETY_FACTOR — all removed.
 #   - Cold-start EMA and pool sizing formulas.
 #
+# * STANDALONE
+#   This server is self-contained: one process, one model, an OpenAI-
+#   compatible HTTP API, and a /health that tells you if the engine is
+#   alive. It has no external coordinator, service registry, or shared
+#   datastore — run one, or run several behind any load balancer you like.
+#
 
 import asyncio
 import json
 import logging
 import os
+import subprocess
+import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Annotated, Optional
 
-import redis.asyncio as aioredis
+# --- Optional frozen-model (offline) mode ------------------------------------
+# ONLINE by default so a fresh install can fetch its model. Set UTTERA_OFFLINE=1
+# to pin the engine to the local cache, so a model you have already validated
+# can't silently re-download or change on a reboot. Applied BEFORE the ML
+# libraries import (they read these variables at import time). You can also set
+# HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE / MODELSCOPE_OFFLINE directly.
+if os.environ.get("UTTERA_OFFLINE", "0").lower() in ("1", "true", "yes"):
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("MODELSCOPE_OFFLINE", "1")
+
 import torch
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form, HTTPException, Request
@@ -164,16 +207,25 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 
 # vLLM imports (after .env load so VLLM_* env vars are honoured).
 from vllm.engine.arg_utils import AsyncEngineArgs  # noqa: E402
-from vllm.entrypoints.openai.speech_to_text.protocol import (  # noqa: E402
+# vLLM (>= 0.24) keeps the speech-to-text handlers under
+# `entrypoints.speech_to_text.{transcription,translation}`. The class and
+# method signatures are unchanged from the old 0.19 location
+# (vllm.entrypoints.openai.speech_to_text.{protocol,serving}). Verified on
+# 0.24 and 0.30.
+from vllm.entrypoints.speech_to_text.transcription.protocol import (  # noqa: E402
     TranscriptionRequest,
+)
+from vllm.entrypoints.speech_to_text.translation.protocol import (  # noqa: E402
     TranslationRequest,
 )
 from vllm.entrypoints.openai.models.serving import (  # noqa: E402
     BaseModelPath,
     OpenAIServingModels,
 )
-from vllm.entrypoints.openai.speech_to_text.serving import (  # noqa: E402
+from vllm.entrypoints.speech_to_text.transcription.serving import (  # noqa: E402
     OpenAIServingTranscription,
+)
+from vllm.entrypoints.speech_to_text.translation.serving import (  # noqa: E402
     OpenAIServingTranslation,
 )
 from vllm.usage.usage_lib import UsageContext  # noqa: E402
@@ -183,7 +235,7 @@ from vllm.v1.engine.async_llm import AsyncLLM  # noqa: E402
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "1.4.0"
+SERVER_VERSION = "1.5.0"
 
 # Valid response formats per OpenAI spec. vLLM's own handler natively
 # supports json/text/verbose_json but rejects srt/vtt; we always request
@@ -224,10 +276,6 @@ VLLM_MAX_NUM_SEQS = int(os.environ.get("VLLM_MAX_NUM_SEQS", "64"))
 VLLM_MAX_MODEL_LEN = int(os.environ.get("VLLM_MAX_MODEL_LEN", "448"))
 VLLM_ENFORCE_EAGER = os.environ.get("VLLM_ENFORCE_EAGER", "false").lower() in ("1", "true", "yes")
 
-# Drain time (seconds) considered 100% load for routing score. Matches the
-# hotcold sibling so the upstream router can use a single threshold.
-ROUTING_DRAIN_CAP_SECONDS = float(os.environ.get("ROUTING_DRAIN_CAP_SECONDS", "120"))
-
 # LibreTranslate post-processing for /v1/audio/translations.
 # When this URL is set, /v1/audio/translations first transcribes via the
 # Whisper model (so turbo — which lacks the "translate" task — still works),
@@ -239,14 +287,41 @@ LIBRETRANSLATE_URL = os.environ.get("LIBRETRANSLATE_URL", "").rstrip("/")
 LIBRETRANSLATE_API_KEY = os.environ.get("LIBRETRANSLATE_API_KEY", "")
 LIBRETRANSLATE_TIMEOUT_S = float(os.environ.get("LIBRETRANSLATE_TIMEOUT_S", "30"))
 
-# Redis self-registration (opt-in). If REDIS_URL is unset, publishing is skipped.
-REDIS_URL = os.environ.get("REDIS_URL", "")
-REDIS_NODE_HOST = os.environ.get("NODE_HOST", "localhost")
-REDIS_NODE_PORT = int(os.environ.get("NODE_PORT", "9005"))
-REDIS_NODE_ID = os.environ.get("NODE_ID", "") or f"{REDIS_NODE_HOST}:{REDIS_NODE_PORT}"
-REDIS_KEY = f"stt:nodes:{REDIS_NODE_ID}"
-REDIS_PUBLISH_INTERVAL = float(os.environ.get("REDIS_PUBLISH_INTERVAL", "0.5"))
-REDIS_TTL = max(2, int(REDIS_PUBLISH_INTERVAL * 3 + 1))
+# Maximum upload size. A body larger than this is rejected with HTTP 413
+# (Payload Too Large) before it ever reaches the engine. 413 is a client
+# error and does NOT count towards the engine circuit breaker, so a caller
+# sending huge files cannot trip the breaker.
+MAX_FILESIZE_MB = int(os.environ.get("MAX_FILESIZE_MB", "250"))
+
+# Engine circuit breaker: N consecutive engine (5xx) failures mark the server
+# as not-ready so /health returns 503 instead of routing work to a dead engine.
+# A single later success clears it, so a transient fault doesn't wedge the
+# server. Only 5xx count — 4xx are the caller's fault (unreadable audio,
+# unsupported language) and must not open the breaker.
+ENGINE_FAIL_THRESHOLD = int(os.environ.get("ENGINE_FAIL_THRESHOLD", "3"))
+
+# Recovery self-probe: while the breaker is open, every ENGINE_PROBE_SECONDS
+# the server sends a tiny in-process request to itself; a 200 clears the
+# breaker automatically, without a manual restart. Costs nothing while the
+# breaker is closed (a single boolean check per cycle).
+ENGINE_PROBE_SECONDS = int(os.environ.get("ENGINE_PROBE_SECONDS", "30"))
+
+# Voice-activity gate (VAD). Whisper hallucinates text on silence (it learned
+# "Thank you." / "Gracias." after quiet stretches from its subtitle training
+# data). The gate decides ONE thing: if the whole clip has no speech, the model
+# is not called and an empty transcription is returned. It never trims audio,
+# and on any doubt (no detector, decode failure, exception) it transcribes —
+# the gate must never be the reason a good transcription is lost.
+VAD_ENABLED = os.environ.get("VAD_ENABLED", "1").lower() not in ("0", "false", "no")
+VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.5"))
+# Path to the Silero JIT model. Empty = look inside the installed package.
+VAD_JIT = os.environ.get("VAD_JIT", "")
+# Window stride. Silero's window is 512 samples = 32 ms. With stride 4 we look
+# at 32 ms out of every 128, which does not miss speech (any real utterance
+# lasts hundreds of ms and lands in several inspected windows); what it saves
+# is the expensive case — proving 30 s of audio has NO speech means scanning
+# all of it (with speech you exit on the first window).
+VAD_STRIDE = max(1, int(os.environ.get("VAD_STRIDE", "4")))
 
 # -------------------------------
 # 2. Runtime State
@@ -266,8 +341,15 @@ _in_flight: int = 0
 _total_completed: int = 0
 _total_errors: int = 0
 
-_redis: Optional[aioredis.Redis] = None
-_redis_task: Optional[asyncio.Task] = None
+# Engine circuit breaker state.
+_consecutive_engine_failures: int = 0
+_engine_probe_task: Optional[asyncio.Task] = None
+
+# VAD state. The Silero model carries internal state and is NOT thread-safe on
+# a single instance, so every use is serialised under this lock.
+_vad_model = None
+_vad_broken: bool = False
+_vad_lock = threading.Lock()
 
 
 # -------------------------------
@@ -357,52 +439,106 @@ _KNOWN_ENDPOINTS = {
 
 
 # -------------------------------
-# 3. Lifespan — engine + handlers + Redis
+# 3. Engine circuit breaker + recovery probe
 # -------------------------------
 
-async def _publish_to_redis_loop() -> None:
-    """Background task: publish routing state to Redis every interval.
+def _engine_failure(http_status: int, exc: Optional[Exception] = None) -> None:
+    """Count an engine failure. Open the breaker on reaching the threshold.
 
-    No-op if Redis is unreachable; failures never affect request serving.
+    Only 5xx count. Below the threshold nothing changes; once N consecutive
+    engine failures are seen the server flips to not-ready and /health serves
+    503 until a later success (or the recovery probe) clears it.
     """
-    global _redis
+    global _consecutive_engine_failures, _engine_ready, _engine_error
+    if http_status < 500:
+        return                      # caller's fault — the engine is fine
+    _consecutive_engine_failures += 1
+    if _consecutive_engine_failures >= ENGINE_FAIL_THRESHOLD and _engine_ready:
+        _engine_ready = False
+        _engine_error = ("circuit_breaker: %d consecutive engine failures; last: %s"
+                         % (_consecutive_engine_failures,
+                            f"{type(exc).__name__}: {exc}" if exc else "unknown"))[:300]
+        log.error("CIRCUIT BREAKER OPEN: %s — /health now reports unavailable",
+                  _engine_error)
+
+
+def _engine_ok() -> None:
+    """A success clears the breaker and resets the count."""
+    global _consecutive_engine_failures, _engine_ready, _engine_error
+    _consecutive_engine_failures = 0
+    if not _engine_ready:
+        _engine_ready = True
+        _engine_error = None
+        log.warning("CIRCUIT BREAKER CLOSED: the engine responds again")
+
+
+def _probe_wav(seconds: float = 1.0, hz: int = 440, sr: int = 16000) -> bytes:
+    """A mono 16 kHz WAV holding a tone. A tone, not silence: pure silence can
+    make speech models fail, and a failing probe would keep the breaker open
+    forever."""
+    import io as _bio
+    import math
+    import struct
+    import wave as _w
+    n = int(seconds * sr)
+    samples = b"".join(struct.pack("<h", int(12000 * math.sin(2 * math.pi * hz * i / sr)))
+                       for i in range(n))
+    buf = _bio.BytesIO()
+    with _w.open(buf, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(sr)
+        f.writeframes(samples)
+    return buf.getvalue()
+
+
+async def _engine_probe_loop() -> None:
+    """While the engine is not ready, send a tiny in-process request to the
+    app every ENGINE_PROBE_SECONDS. A 200 makes the endpoint call _engine_ok(),
+    which clears the breaker — no manual restart needed. Runs entirely in
+    process via httpx's ASGITransport, so it needs no network or open port.
+    """
+    import httpx
     while True:
         try:
-            await asyncio.sleep(REDIS_PUBLISH_INTERVAL)
-            if _redis is None:
+            await asyncio.sleep(ENGINE_PROBE_SECONDS)
+            # Probe whenever the engine is not ready — whether the breaker
+            # opened it or startup failed outright.
+            if _engine_ready:
                 continue
-            load = min(1.0, _in_flight / max(1, VLLM_MAX_NUM_SEQS))
-            accepts = bool(_engine_ready) and load < 1.0
-            payload = json.dumps({
-                "load_score":       load,
-                "accepts_requests": accepts,
-                "host":              REDIS_NODE_HOST,
-                "port":              REDIS_NODE_PORT,
-                "version":           SERVER_VERSION,
-                "engine":            "vllm",
-                "model":             SERVED_MODEL_NAME,
-                "ts":                time.time(),
-            })
-            try:
-                await _redis.set(REDIS_KEY, payload, ex=REDIS_TTL)
-            except Exception as e:
-                log.debug(f"Redis publish failed (non-fatal): {e}")
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://probe",
+                                         timeout=120.0) as cli:
+                r = await cli.post("/v1/audio/transcriptions",
+                                   files={"file": ("probe.wav", _probe_wav(), "audio/wav")},
+                                   data={"model": "whisper-1"})
+            if r.status_code == 200:
+                log.info("probe: the engine responds again")
+            else:
+                log.warning("probe: the engine is still down (HTTP %s)", r.status_code)
         except asyncio.CancelledError:
-            break
+            raise
         except Exception as e:
-            log.warning(f"Redis publish loop error: {e}")
+            log.warning("probe: failed to probe: %s", e)
 
+
+# -------------------------------
+# 3b. Lifespan — engine + handlers
+# -------------------------------
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     global _engine, _transcription_handler, _translation_handler
-    global _engine_ready, _engine_error, _redis, _redis_task
+    global _engine_ready, _engine_error, _engine_probe_task
+    global _engine, _transcription_handler, _translation_handler
+    global _engine_ready, _engine_error
 
     log.info(f"Starting Uttera STT vLLM v{SERVER_VERSION} — model={WHISPER_MODEL}")
 
     try:
-        # vLLM 0.19 infers the runner from the model architecture (Whisper
-        # triggers the transcription path automatically); no `task` kwarg.
+        # vLLM infers the runner from the model architecture (Whisper triggers
+        # the transcription path automatically); no `task` kwarg. Verified on
+        # 0.24 and 0.30.
         engine_args = AsyncEngineArgs(
             model=WHISPER_MODEL,
             served_model_name=SERVED_MODEL_NAME,
@@ -457,35 +593,19 @@ async def _lifespan(app: FastAPI):
         _engine_error = str(e)
         log.exception("Engine init failed — server will serve /health 503")
 
-    # Redis self-registration (optional).
-    if REDIS_URL:
-        try:
-            _redis = aioredis.from_url(REDIS_URL, decode_responses=False)
-            await _redis.ping()
-            _redis_task = asyncio.create_task(_publish_to_redis_loop())
-            log.info(f"Redis registered at {REDIS_KEY}")
-        except Exception as e:
-            log.warning(f"Redis unavailable, skipping self-registration: {e}")
-            _redis = None
+    # Recovery self-probe: clears the breaker (or a failed startup) without a
+    # manual restart. Cheap while the engine is ready (one boolean per cycle).
+    _engine_probe_task = asyncio.create_task(_engine_probe_loop())
 
     yield
 
     # Shutdown
     log.info("Shutting down…")
-    if _redis_task:
-        _redis_task.cancel()
+    if _engine_probe_task:
+        _engine_probe_task.cancel()
         try:
-            await _redis_task
+            await _engine_probe_task
         except (asyncio.CancelledError, Exception):
-            pass
-    if _redis:
-        try:
-            await _redis.delete(REDIS_KEY)
-        except Exception:
-            pass
-        try:
-            await _redis.aclose()
-        except Exception:
             pass
     if _engine is not None:
         try:
@@ -499,6 +619,74 @@ app = FastAPI(
     version=SERVER_VERSION,
     lifespan=_lifespan,
 )
+
+
+# ── The right status code, not a blanket 500 ────────────────────────────────
+# A 500 says "I broke". When the request is at fault, say so with a 4xx — and
+# it's not cosmetic: 5xx failures count towards the engine circuit breaker, so
+# a caller sending oversized text could otherwise trip the breaker for everyone.
+#   · truncated JSON body            -> 400 (was 500)
+#   · text over max_model_len        -> 413 (was 500)
+#   · GPU OOM on a busy server       -> 503 (busy, not broken; also excluded
+#                                            from the breaker, with Retry-After)
+import re
+from fastapi.responses import JSONResponse as _ErrResp
+
+_SIGNS_TOO_LONG = ("max_model_len", "prompt_len", "context length", "too long",
+                   "maximum context", "exceeds")
+_SIGNS_OOM = ("out of memory", "outofmemoryerror", "cuda error: out of memory",
+              "cublas_status_alloc_failed")
+
+
+def _useful_line(exc) -> str:
+    """Pull the line that explains the limit and DROP the traceback.
+
+    A traceback in the response would leak the server's internal paths and
+    package names, and is unreadable. We return just the line that mentions
+    the limit."""
+    for line in reversed(str(exc).splitlines()):
+        low = line.lower()
+        if any(s in low for s in _SIGNS_TOO_LONG) and 'file "' not in low:
+            return re.sub(r"^[A-Za-z_]+Error:\s*", "", line.strip())[:300]
+    return "the request exceeds the model's limit"
+
+
+def _classify_error(exc):
+    """Return (status, detail) by inspecting the error text, or (None, None)."""
+    t = str(exc).lower()
+    if any(s in t for s in _SIGNS_OOM):
+        # Busy, not broken. A 503 doesn't count towards the breaker and tells
+        # the caller to retry, which is the truth.
+        return 503, "the server has no free memory right now; retry shortly"
+    if any(s in t for s in _SIGNS_TOO_LONG):
+        return 413, _useful_line(exc)
+    return None, None
+
+
+def _install_error_handlers(app):
+    @app.exception_handler(json.JSONDecodeError)
+    async def _on_json_error(request, exc):
+        return _ErrResp(status_code=400,
+                        content={"detail": "malformed JSON body: %s" % exc})
+
+    async def _on_generic_error(request, exc):
+        status, detail = _classify_error(exc)
+        if status == 503:
+            return _ErrResp(status_code=503, headers={"Retry-After": "30"},
+                            content={"detail": detail})
+        if status:
+            return _ErrResp(status_code=status, content={"detail": detail})
+        # What we can't classify stays a 500: we don't disguise a possible
+        # server fault as a client error.
+        return _ErrResp(status_code=500,
+                        content={"detail": "%s: %s" % (type(exc).__name__, str(exc)[:300])})
+
+    app.add_exception_handler(ValueError, _on_generic_error)
+    app.add_exception_handler(RuntimeError, _on_generic_error)   # includes OutOfMemoryError
+
+
+_install_error_handlers(app)
+# ────────────────────────────────────────────────────────────────────────────
 
 # Opt-in CORS middleware. API-first deployments don't need it, so CORS
 # stays disabled by default. Set CORS_ALLOW_ORIGINS to a comma-separated
@@ -586,13 +774,6 @@ def _update_rps() -> None:
             else:
                 _ema_rps = _EMA_ALPHA_RPS * inst_rps + (1.0 - _EMA_ALPHA_RPS) * _ema_rps
     _last_completion_ts = now
-
-
-def _routing_state() -> dict:
-    """Current load/accepts snapshot. Shared by /health and Redis publisher."""
-    load = min(1.0, _in_flight / max(1, VLLM_MAX_NUM_SEQS))
-    accepts = bool(_engine_ready) and load < 1.0
-    return {"load_score": load, "accepts_requests": accepts}
 
 
 # Whisper emits ISO-639-1 codes (e.g. "zh") but LibreTranslate expects
@@ -777,6 +958,85 @@ def _map_engine_exception(exc: Exception) -> HTTPException:
 
 
 # -------------------------------
+# 4b. Voice-activity gate (VAD)
+# -------------------------------
+
+def _vad_loaded():
+    """The Silero JIT model, loaded BY HAND without importing `silero_vad`.
+
+    Two reasons:
+      1. `import silero_vad` drags `onnxruntime` into the process even when the
+         torch model is the one used. For a gate the per-window probability is
+         enough — no package, no segmentation needed.
+      2. The model carries state and is NOT safe to call from several threads
+         on one instance (reproduced: concurrent requests -> `free(): invalid
+         pointer` and a process crash). Hence the lock around every use.
+    """
+    global _vad_model, _vad_broken
+    if _vad_model is not None or _vad_broken:
+        return _vad_model
+    with _vad_lock:
+        if _vad_model is None and not _vad_broken:
+            try:
+                path = VAD_JIT
+                if not path:
+                    import importlib.util as _u
+                    path = os.path.join(
+                        os.path.dirname(_u.find_spec("silero_vad").origin),
+                        "data", "silero_vad.jit")
+                _vad_model = torch.jit.load(path)
+                _vad_model.eval()
+                print("VAD: model loaded from %s (threshold %.2f)" % (path, VAD_THRESHOLD),
+                      file=sys.stderr, flush=True)
+            except Exception as e:
+                _vad_broken = True
+                print("VAD: unavailable (%s); transcribing everything, as before" % e,
+                      file=sys.stderr, flush=True)
+    return _vad_model
+
+
+def _to_16k(audio_bytes: bytes):
+    """The audio as float32 mono at 16 kHz via ffmpeg — the same path the model
+    uses to read it, not a second route that could disagree."""
+    import numpy as np
+    cmd = ["ffmpeg", "-nostdin", "-threads", "0", "-i", "pipe:0",
+           "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", "16000", "pipe:1"]
+    p = subprocess.run(cmd, input=audio_bytes, capture_output=True, check=True)
+    return np.frombuffer(p.stdout, np.int16).flatten().astype("float32") / 32768.0
+
+
+def _no_voice(audio_bytes: bytes) -> bool:
+    """True ONLY if the detector asserts there is no speech anywhere in the clip.
+
+    On any doubt it returns False and the audio is transcribed: the gate must
+    never be the reason a good transcription is lost.
+    """
+    if not VAD_ENABLED or _vad_loaded() is None:
+        return False
+    try:
+        pcm = _to_16k(audio_bytes)
+        if pcm.size < 512:
+            return False
+        m = _vad_model
+        with _vad_lock:            # a stateful instance: one thread at a time
+            m.reset_states()
+            with torch.no_grad():
+                for i in range(0, len(pcm) - 512, 512 * VAD_STRIDE):
+                    chunk = torch.from_numpy(pcm[i:i + 512]).unsqueeze(0)
+                    if float(m(chunk, 16000).item()) >= VAD_THRESHOLD:
+                        return False          # speech found
+        return True
+    except Exception as e:
+        print("VAD: could not decide (%s); transcribing" % e,
+              file=sys.stderr, flush=True)
+        return False
+
+
+def _empty_result() -> dict:
+    return {"text": "", "segments": [], "language": ""}
+
+
+# -------------------------------
 # 5. Endpoints
 # -------------------------------
 
@@ -826,7 +1086,9 @@ async def create_transcriptions(
         except Exception as exc:
             _total_errors += 1
             _ERRORS_TOTAL.labels(type="model").inc()
-            raise _map_engine_exception(exc) from exc
+            _http_err = _map_engine_exception(exc)
+            _engine_failure(_http_err.status_code, exc)
+            raise _http_err from exc
         finally:
             _in_flight -= 1
             _INFLIGHT_GAUGE.dec()
@@ -845,6 +1107,19 @@ async def create_transcriptions(
     internal_request = request.model_copy(update={"response_format": "verbose_json"})
 
     audio_data = await request.file.read()
+    # 413, not 400: the file is valid, it just doesn't fit. And a 4xx doesn't
+    # count towards the circuit breaker, so a caller with huge files can't take
+    # the server down.
+    _mb = len(audio_data) / 1048576
+    if _mb > MAX_FILESIZE_MB:
+        raise HTTPException(status_code=413,
+                            detail=f"File is {_mb:.0f} MB; the limit is {MAX_FILESIZE_MB} MB.")
+    # The gate goes here, BEFORE occupying the engine: with no speech there is
+    # nothing to transcribe and we save the GPU. Non-streaming path only.
+    if await asyncio.to_thread(_no_voice, audio_data):
+        print("VAD: no speech; the model is not called", file=sys.stderr, flush=True)
+        _engine_ok()
+        return _render_response(_empty_result(), user_format)
     _in_flight += 1
     _INFLIGHT_GAUGE.inc()
     try:
@@ -855,7 +1130,9 @@ async def create_transcriptions(
     except Exception as exc:
         _total_errors += 1
         _ERRORS_TOTAL.labels(type="model").inc()
-        raise _map_engine_exception(exc) from exc
+        _http_err = _map_engine_exception(exc)
+        _engine_failure(_http_err.status_code, exc)
+        raise _http_err from exc
     finally:
         _in_flight -= 1
         _INFLIGHT_GAUGE.dec()
@@ -877,6 +1154,7 @@ async def create_transcriptions(
             _dur = segs[-1].get("end")
     if isinstance(_dur, (int, float)) and _dur > 0:
         _AUDIO_SECONDS_TOTAL.labels(endpoint="/v1/audio/transcriptions").inc(float(_dur))
+    _engine_ok()
     return _render_response(result_dict, user_format)
 
 
@@ -927,6 +1205,10 @@ async def create_translations(
     )
 
     audio_data = await request.file.read()
+    _mb = len(audio_data) / 1048576
+    if _mb > MAX_FILESIZE_MB:
+        raise HTTPException(status_code=413,
+                            detail=f"File is {_mb:.0f} MB; the limit is {MAX_FILESIZE_MB} MB.")
     _in_flight += 1
     _INFLIGHT_GAUGE.inc()
     try:
@@ -937,11 +1219,17 @@ async def create_translations(
     except Exception as exc:
         _total_errors += 1
         _ERRORS_TOTAL.labels(type="model").inc()
-        raise _map_engine_exception(exc) from exc
+        _http_err = _map_engine_exception(exc)
+        _engine_failure(_http_err.status_code, exc)
+        raise _http_err from exc
     finally:
         _in_flight -= 1
         _INFLIGHT_GAUGE.dec()
         _update_rps()
+
+    # The transcription succeeded — clear the breaker regardless of what the
+    # LibreTranslate step does next (that's a separate backend).
+    _engine_ok()
 
     err = _unwrap_vllm_error(transcribed)
     if err is not None:
@@ -985,8 +1273,7 @@ async def create_translations(
     # segments individually so SRT/VTT subtitles keep their original
     # timings aligned to the correct translated text. For compact JSON /
     # plain text responses we only need `translated_text`, but doing both
-    # in one gather keeps the total latency ~ 1× LibreTranslate call
-    # (sphinx:5200 handles the parallelism trivially).
+    # in one gather keeps the total latency ~ 1× a single LibreTranslate call.
     lt_source = source_lang or "auto"
     try:
         tasks: list = [
@@ -1043,7 +1330,6 @@ async def list_models():
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
-    state = _routing_state()
     body = {
         "status": "ok" if _engine_ready else "starting",
         "version": SERVER_VERSION,
@@ -1052,11 +1338,11 @@ async def health():
         "served_as": SERVED_MODEL_NAME,
         "engine_ready": _engine_ready,
         "engine_error": _engine_error,
-        "routing": state,
         "metrics": {
             "in_flight": _in_flight,
             "total_completed": _total_completed,
             "total_errors": _total_errors,
+            "consecutive_engine_failures": _consecutive_engine_failures,
             "ema_rps": _ema_rps,
             "vram_free_gb": round(_vram_free_gb(), 2),
             "max_num_seqs": VLLM_MAX_NUM_SEQS,

@@ -2,16 +2,45 @@
 # audio extra — all required by vllm.multimodal.media.audio.load_audio().
 # Without these the /v1/audio/transcriptions endpoint raises HTTP 500
 # "Invalid or unsupported audio file" even for valid WAV or MP3 input.
-vllm[audio]>=0.19.0,<0.20.0
-torch>=2.9.0,<2.11.0
-torchaudio>=2.9.0,<2.11.0
+#
+# vLLM >= 0.24 required, for two reasons:
+#   1. Security. The 0.19.x series this server used to pin carried published
+#      advisories — an OpenAI-server auth bypass (critical) plus code-exec, a
+#      remote DoS, and a ReDoS. All four are patched by 0.24.0.
+#   2. API layout. From ~0.20 the speech-to-text serving handlers moved to
+#      vllm.entrypoints.speech_to_text.{transcription,translation}, which
+#      main_stt.py now imports. (Signatures are unchanged from 0.19.)
+# Pinned to the 0.24.x line on purpose: 0.24 clears all four advisories, and
+# releases 0.25–0.30 are large-LLM optimizations (Kimi-K3, DeepSeek MLA, MXFP4,
+# speculative decoding, scale-out) with nothing for Whisper STT — while 0.30
+# reintroduces FlashInfer JIT friction on consumer Blackwell (see below). Bump
+# the ceiling deliberately, after testing, not automatically.
+vllm[audio]>=0.24.0,<0.25
+# torch/torchaudio are resolved by vllm's own pins; do not pin them here or you
+# may fight vllm's constraint solver.
+#
+# Consumer Blackwell (RTX 50-series, sm_120) — if the engine fails at startup
+# with a FlashInfer arch/JIT error, the FlashInfer sampler kernels don't build
+# from a pip-only CUDA toolchain. Either install a Blackwell-ready FlashInfer
+# build, or disable the FlashInfer sampler and use a non-FlashInfer attention
+# backend, e.g.:
+#     export VLLM_USE_FLASHINFER_SAMPLER=0
+#     export VLLM_ATTENTION_BACKEND=FLEX_ATTENTION
+#     export FLASHINFER_CUDA_ARCH_LIST=12.0f   # note the trailing 'f'
+# Datacenter GPUs (A100/H100/…) need none of this.
 fastapi
 uvicorn
 pydantic>=2.0
 python-multipart
 python-dotenv
-redis[asyncio]>=5.0.0
 huggingface-hub
+
+# Voice-activity gate (VAD) on /v1/audio/transcriptions: skips the model on
+# clips with no speech, which stops Whisper hallucinating text on silence.
+# The JIT model is loaded by hand; onnxruntime is deliberately NOT pulled in.
+# Optional — if absent, the gate disables itself and every clip is transcribed.
+silero-vad>=5.1
+numpy
 
 # Prometheus /metrics endpoint — uses the default global registry.
 # Scrape with Telegraf's inputs.prometheus, Prometheus itself, or any

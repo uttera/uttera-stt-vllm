@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-09-24
+
+Robustness sweep. Five additions, all env-gated and safe by default. No
+breaking changes to the request API. The `/health` payload dropped its
+`routing` block (the server is now standalone) and gained
+`metrics.consecutive_engine_failures`.
+
+### Added
+
+- **Optional frozen-model mode.** Set `UTTERA_OFFLINE=1` and the server sets
+  `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` / `MODELSCOPE_OFFLINE` before the
+  ML libraries import, so a validated model never silently re-downloads or
+  changes on a reboot. Online by default (a fresh install can fetch its model).
+- **Voice-activity gate (VAD).** Returns an empty transcription for clips
+  with no speech, which stops Whisper hallucinating text (it learned to emit
+  "Thank you." / "Gracias." after silence from its subtitle training data).
+  On any doubt the clip is transcribed. Silero JIT model, on CPU, decides
+  30 s in milliseconds. Env: `VAD_ENABLED`, `VAD_THRESHOLD`, `VAD_JIT`,
+  `VAD_STRIDE`. Needs the `silero-vad` package; disables itself if absent.
+- **Engine circuit breaker.** `ENGINE_FAIL_THRESHOLD` consecutive engine
+  (5xx) failures flip the server to not-ready so `/health` returns `503`; a
+  later success clears it. 4xx (caller errors) never open it.
+- **Recovery self-probe.** While the breaker is open, an in-process probe (a
+  synthetic tone, no network) retries every `ENGINE_PROBE_SECONDS` and
+  auto-clears the breaker on success — no manual restart.
+- **`silero-vad` and `numpy`** added to `requirements.txt`.
+
+### Changed
+
+- **Correct HTTP status codes instead of a blanket `500`:** oversized upload
+  → `413` (`MAX_FILESIZE_MB`, default 250), text over the model's context →
+  `413`, GPU out-of-memory → `503` (busy, not broken; excluded from the
+  breaker, with `Retry-After`), malformed JSON → `400`. Tracebacks are
+  stripped from error bodies.
+- **`/health`**: removed the `routing` block; added
+  `metrics.consecutive_engine_failures`. Returns `503` while the breaker is
+  open.
+- **Requires vLLM ≥ 0.24** (was `>=0.19,<0.20`). This clears four published
+  advisories in the 0.19.x line — an OpenAI-server auth bypass (critical),
+  code exec, a remote DoS and a ReDoS, all patched by 0.24.0 — and follows
+  the speech-to-text handlers to their `entrypoints.speech_to_text.*` import
+  path (signatures unchanged). Releases 0.25–0.30 add nothing for Whisper STT,
+  so 0.24 is the floor. Consumer Blackwell (sm_120) needs a FlashInfer/JIT
+  workaround; see `requirements.txt`.
+
+### Removed
+
+- **Redis self-registration.** This server is now standalone — one process,
+  one model, an OpenAI-compatible API and a `/health`. Run one, or run
+  several behind any load balancer.
+
 ## [1.4.0] - 2026-04-21
 
 Prometheus `/metrics` endpoint. Additive only — all existing
@@ -78,10 +129,8 @@ endpoints unchanged.
 ### Changed
 
 - **Default port migrated from `5000` → `9005`** in lockstep with the
-  sibling `uttera-stt-hotcold` v2.3.0. Canonical Uttera-stack scheme:
-  STT services on `9005`, TTS services on `9004`. The Gatekeeper and
-  clients route by service family (STT/TTS) without needing to know
-  which backend (hotcold vs vllm) is active behind the port.
+  sibling `uttera-stt-hotcold` v2.3.0, so both STT backends listen on the
+  same default port and are drop-in swappable behind a reverse proxy.
 
   **Why move off `5000`:** collision with macOS AirPlay Receiver
   (since Monterey) and with Docker Registry v2 default. The
@@ -97,7 +146,7 @@ endpoints unchanged.
 
 Deployments that already override `PORT` via env var: no change
 required. Deployments using the old default (`:5000`):
-- Repoint your Gatekeeper / reverse proxy at `:9005`.
+- Repoint your reverse proxy / load balancer at `:9005`.
 - Or set `PORT=5000` in your env to preserve the old endpoint.
 - Docker users: update your `-p` flag or `docker-compose.yml`.
 
@@ -308,16 +357,11 @@ changes until the API surface stabilises.
   - `POST /v1/audio/translations` → `OpenAIServingTranslation`
   - `GET /v1/models` (custom, Uttera-flavoured)
   - `GET /health` (custom, aligned with the sibling `uttera-stt-hotcold`
-    schema — `status`, `version`, `engine`, `model`, `routing.load_score`,
-    `routing.accepts_requests`, `metrics.*`)
+    schema — `status`, `version`, `engine`, `model`, `engine_ready`,
+    `metrics.*`)
 - **Configurable model** via `WHISPER_MODEL` env var. Default:
   `openai/whisper-large-v3-turbo`. Any HuggingFace model compatible with
   vLLM's `task="transcription"` path should work.
-- **Optional Redis self-registration** (parity with `uttera-stt-hotcold`
-  and `uttera-tts-hotcold`). When `REDIS_URL` is set, the server
-  publishes `{load_score, accepts_requests, host, port, version,
-  engine="vllm", model, ts}` to `stt:nodes:{NODE_ID}` with a short TTL
-  on a background tick. No-op when `REDIS_URL` is unset.
 - **Engine tuning env vars**: `VLLM_DTYPE`, `VLLM_GPU_MEM_UTIL`,
   `VLLM_MAX_NUM_SEQS`, `VLLM_MAX_MODEL_LEN`, `VLLM_ENFORCE_EAGER`.
   Defaults validated on RTX 5090 + Whisper-large-v3-turbo.

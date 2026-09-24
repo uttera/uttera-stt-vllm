@@ -9,14 +9,17 @@
 High-throughput Speech-to-Text server built on **vLLM continuous batching**.
 Whisper-large-v3-turbo today, room for future Transformer STT backends.
 
-> **Status**: v1.3.0 — stable. The API surface (endpoints, response
-> format contract, `X-Translation-Mode` header, canonical port `9005`)
-> is frozen under SemVer; no breaking changes inside `1.x`. v1.1.0
-> introduced the LibreTranslate pipeline (arbitrary target languages,
-> works on Whisper-turbo). v1.2.0 added real SRT / WebVTT /
-> verbose_json rendering, opt-in CORS, `HEAD /health`, `temperature`
-> validation, and mapped vLLM error codes to proper HTTP statuses.
-> v1.3.0 adopted the canonical Uttera-stack port `9005`.
+> **Status**: v1.5.0 — stable and standalone. The request API surface
+> (endpoints, response-format contract, `X-Translation-Mode` header, default
+> port `9005`) is frozen under SemVer; no breaking changes inside `1.x`.
+> v1.1.0 introduced the LibreTranslate pipeline (arbitrary target languages,
+> works on Whisper-turbo); v1.2.0 added real SRT / WebVTT / verbose_json
+> rendering, opt-in CORS, `HEAD /health`, `temperature` validation and proper
+> HTTP status mapping; v1.4.0 added a Prometheus `/metrics` endpoint; v1.5.0
+> is a robustness sweep — voice-activity gate, engine circuit breaker with a
+> recovery self-probe, optional frozen-model mode, and correct 413/503/400
+> codes — and requires vLLM ≥ 0.24 (clearing four advisories in the 0.19 line).
+> The server is self-contained: run one, or run several behind any proxy.
 > See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## Positioning
@@ -61,8 +64,7 @@ support since v0.6.6). A **single Python process** hosts:
   sampling, and OpenAI-shaped responses.
 - A thin FastAPI layer (`main_stt.py`) that exposes the four endpoints
   Uttera expects — `/v1/audio/transcriptions`, `/v1/audio/translations`,
-  `/v1/models`, `/health` — and carries the Redis self-registration
-  protocol from the sibling repos.
+  `/v1/models`, `/health`.
 
 **What is here (current release)**:
 
@@ -106,16 +108,28 @@ support since v0.6.6). A **single Python process** hosts:
 
 *Operations*
 - `GET /health` **and `HEAD /health`** — liveness + throughput +
-  VRAM + routing snapshot. `HEAD` is useful for uptime probes that
-  don't parse JSON.
+  VRAM snapshot. Returns `503` while the model loads or the circuit
+  breaker is open. `HEAD` is useful for uptime probes that don't
+  parse JSON.
 - Opt-in `CORSMiddleware` via `CORS_ALLOW_ORIGINS` env var (disabled
   by default — API-first deployments don't need CORS, and enabling
   it unconditionally broadens the attack surface).
-- Canonical Uttera-stack port **`9005`** (STT family). TTS family
-  uses `9004`. Swapping `hotcold ↔ vllm` is a backend change, not
-  a port change.
-- Optional Redis self-registration (`REDIS_URL`) — same protocol as
-  the sibling `uttera-stt-hotcold` and TTS servers.
+- Default port **`9005`**, shared with the sibling `uttera-stt-hotcold`
+  so the two STT backends are drop-in swappable.
+
+*Robustness (v1.5.0)*
+- **Optional frozen-model mode** — set `UTTERA_OFFLINE=1` to pin the engine
+  to its local cache so a validated model can't silently re-download or
+  change after a reboot. Online by default so a fresh install can fetch.
+- **Voice-activity gate** — returns an empty transcription for clips
+  with no speech, so Whisper doesn't hallucinate text on silence.
+  Disables itself if `silero-vad` isn't installed.
+- **Engine circuit breaker + recovery self-probe** — repeated engine
+  failures flip `/health` to `503`; an in-process probe auto-clears it
+  when the engine recovers, no restart needed.
+- **Correct HTTP status codes** — oversized upload or over-long text →
+  `413`, GPU out-of-memory → `503`, malformed JSON → `400`, instead of
+  a blanket `500`.
 
 **What is *not* here**:
 - No hot/cold worker pool, no shared work queue, no subprocess
@@ -132,7 +146,7 @@ for why there are two STT repos.
 
 ## Benchmarks (preview)
 
-Empirical results on 1× RTX 5090, Whisper-large-v3-turbo via vLLM 0.19,
+Empirical results on 1× RTX 5090, Whisper-large-v3-turbo via vLLM,
 400 concurrent requests (20 min of audio each):
 
 | Metric | Value |
@@ -188,7 +202,14 @@ full surface. The most common overrides:
 | `LIBRETRANSLATE_URL` | _(empty)_ | Base URL of a [LibreTranslate](https://libretranslate.com) instance. Required for `/v1/audio/translations` to work on a Whisper model without native translate (incl. turbo). |
 | `LIBRETRANSLATE_API_KEY` | _(empty)_ | Optional, only if your LibreTranslate instance enforces a key. |
 | `LIBRETRANSLATE_TIMEOUT_S` | `30` | Timeout for the translation call. |
-| `REDIS_URL` | _(empty)_ | Optional; enables self-registration for a router. |
+| `VAD_ENABLED` | `1` | Voice-activity gate: skip the model on clips with no speech. Set `0` to disable. |
+| `VAD_THRESHOLD` | `0.5` | Silero speech probability above which a window counts as speech. |
+| `VAD_JIT` | _(empty)_ | Path to the Silero JIT model. Empty = look inside the installed `silero-vad`. |
+| `VAD_STRIDE` | `4` | Inspect one window out of every N (512-sample windows). |
+| `MAX_FILESIZE_MB` | `250` | Reject a larger upload with HTTP 413 before it reaches the engine. |
+| `ENGINE_FAIL_THRESHOLD` | `3` | Consecutive engine (5xx) failures that open the circuit breaker (`/health` → 503). |
+| `ENGINE_PROBE_SECONDS` | `30` | Recovery self-probe interval while the breaker is open. |
+| `UTTERA_OFFLINE` | `0` | Set `1` to pin the engine to the local cache (frozen model) — the server then sets `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` / `MODELSCOPE_OFFLINE` before import. Online by default. |
 
 ## Observability (`/metrics`)
 
