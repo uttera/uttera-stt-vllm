@@ -166,6 +166,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -629,8 +630,6 @@ app = FastAPI(
 #   · text over max_model_len        -> 413 (was 500)
 #   · GPU OOM on a busy server       -> 503 (busy, not broken; also excluded
 #                                            from the breaker, with Retry-After)
-import re
-from fastapi.responses import JSONResponse as _ErrResp
 
 _SIGNS_TOO_LONG = ("max_model_len", "prompt_len", "context length", "too long",
                    "maximum context", "exceeds")
@@ -666,19 +665,19 @@ def _classify_error(exc):
 def _install_error_handlers(app):
     @app.exception_handler(json.JSONDecodeError)
     async def _on_json_error(request, exc):
-        return _ErrResp(status_code=400,
+        return JSONResponse(status_code=400,
                         content={"detail": "malformed JSON body: %s" % exc})
 
     async def _on_generic_error(request, exc):
         status, detail = _classify_error(exc)
         if status == 503:
-            return _ErrResp(status_code=503, headers={"Retry-After": "30"},
+            return JSONResponse(status_code=503, headers={"Retry-After": "30"},
                             content={"detail": detail})
         if status:
-            return _ErrResp(status_code=status, content={"detail": detail})
+            return JSONResponse(status_code=status, content={"detail": detail})
         # What we can't classify stays a 500: we don't disguise a possible
         # server fault as a client error.
-        return _ErrResp(status_code=500,
+        return JSONResponse(status_code=500,
                         content={"detail": "%s: %s" % (type(exc).__name__, str(exc)[:300])})
 
     app.add_exception_handler(ValueError, _on_generic_error)
