@@ -12,7 +12,7 @@
 #
 # Package: uttera-stt-vllm
 # Version: 1.5.0
-# Maintainer: Uttera, Hugo L. Espuny
+# Maintainer: Hugo L. Espuny
 # Description: High-throughput Whisper STT server on vLLM continuous batching.
 #              A single Python process hosts vLLM's AsyncLLM engine; concurrency
 #              is handled by the engine's internal batching — no hot/cold pool,
